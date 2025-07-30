@@ -1,0 +1,43 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.36.0
+numpy>=1.24.0
+pandas>=2.0.0
+Pillow>=10.0.0
+
+# Document processing
+PyMuPDF>=1.23.0  # fitz for PDF processing
+python-docx>=1.1.0
+beautifulsoup4>=4.12.0
+html2text>=2020.1.16
+
+# Langchain ecosystem
+langchain>=0.1.0
+langchain-community>=0.0.13
+langchain-chroma>=0.1.2
+langchain-huggingface>=0.0.1
+langchain-ollama>=0.1.0
+langchain-text-splitters>=0.0.1
+
+# Ollama
+ollama>=0.1.0
+
+# Vector database
+chromadb>=0.4.18
+
+# Web interface
+gradio>=4.12.0
+
+# Embedding models and APIs
+sentence-transformers>=2.2.2
+requests>=2.31.0
+
+# Image processing and vision
+opencv-python>=4.8.0
+
+# Optional: For better performance
+faiss-cpu>=1.7.4  # Alternative vector search
+
+# Development and testing
+pytest>=7.4.0 
