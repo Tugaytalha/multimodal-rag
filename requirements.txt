@@ -1,49 +1,53 @@
 # Core dependencies
-torch>=2.0.0
-torchvision>=0.15.0
-transformers>=4.36.0
-numpy>=1.24.0
-pandas>=2.0.0
-Pillow>=10.0.0
-
-# Document processing
-PyMuPDF>=1.23.0  # fitz for PDF processing
-python-docx>=1.1.0
-beautifulsoup4>=4.12.0
-html2text>=2020.1.16
-striprtf>=0.0.26  # RTF processing
-openpyxl>=3.1.0  # Excel file processing
-xlrd>=2.0.1  # Legacy Excel file support
-markdown>=3.5.0  # Markdown processing
-lxml>=4.9.0  # XML/HTML parsing
-chardet>=5.2.0  # Text encoding detection
-
-# Langchain ecosystem
+gradio>=4.0.0
 langchain>=0.1.0
-langchain-community>=0.0.13
-langchain-chroma>=0.1.2
+langchain-community>=0.0.10
+langchain-core>=0.1.0
+langchain-chroma>=0.1.0
 langchain-huggingface>=0.0.1
-langchain-ollama>=0.1.0
-langchain-text-splitters>=0.0.1
-
-# Ollama
+sentence-transformers>=2.2.0
+chromadb>=0.4.0
 ollama>=0.1.0
 
-# Vector database
-chromadb>=0.4.18
+# Document processing
+PyMuPDF>=1.23.0
+pymupdf4llm>=0.0.20
+python-docx>=0.8.11
+python-pptx>=0.6.21
+Pillow>=9.0.0
 
-# Web interface
-gradio>=4.12.0
+# Additional file format support
+striprtf>=0.0.26
+openpyxl>=3.1.0
+xlrd>=2.0.1
+markdown>=3.5.0
+lxml>=4.9.0
+chardet>=5.2.0
 
-# Embedding models and APIs
-sentence-transformers>=2.2.2
-requests>=2.31.0
+# Text processing and splitting
+langchain-text-splitters>=0.0.1
 
-# Image processing and vision
-opencv-python>=4.8.0
+# ML and embeddings
+torch>=1.9.0
+transformers>=4.20.0
+numpy>=1.21.0
+requests>=2.25.0
 
-# Optional: For better performance
-faiss-cpu>=1.7.4  # Alternative vector search
+# Utilities
+rich>=10.0.0
+pathlib-mate>=1.0.0
+tqdm>=4.60.0
+pandas>=1.3.0
 
-# Development and testing
-pytest>=7.4.0 
+# Web framework
+uvicorn>=0.15.0
+fastapi>=0.68.0
+
+# Image processing
+opencv-python>=4.5.0
+beautifulsoup4>=4.10.0
+html2text>=2020.1.16
+
+# Optional dependencies for enhanced features
+# Install with: pip install transformers[torch]
+# Install with: pip install sentence-transformers[all] 

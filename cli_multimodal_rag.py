@@ -280,16 +280,17 @@ def main():
     # Get CLI-specific configuration
     config = get_cli_config()
     
-    console.print(f"[yellow]Configuration:[/yellow]")
-    console.print(f"   🗄️ Database: {config['chroma_path']}")
-    console.print(f"   📁 Extracted content: {config['extracted_content_path']}")
-    console.print(f"   📝 Text embedding: {config['text_embedding_model']}")
-    console.print(f"   🖼️ Multimodal embedding: {config['multimodal_embedding_model']}")
-    console.print(f"   👁️ VLM model: {config['vlm_model']}")
-    console.print(f"   🤖 LLM model: {config['llm_model']}")
-    console.print(f"   🔑 Jina API key: {'✓ Set' if config['jina_api_key'] else '✗ Not set'}")
-    console.print(f"   🌐 API base URL: {config['jina_api_base_url'] or 'Not set'}")
-    console.print(f"   🏠 Force local: {'Yes' if config['force_local_embeddings'] else 'No'}")
+    # Display system configuration
+    console.print("🔧 [blue]System Configuration:[/blue]")
+    console.print(f"   📁 ChromaDB path: {config['chroma_path']}")
+    console.print(f"   📂 Content path: {config['extracted_content_path']}")
+    console.print(f"   🔤 Text embedding: {config['text_embedding_model']}")
+    console.print(f"   🖼️  Multimodal embedding: {config['multimodal_embedding_model']}")
+    console.print(f"   👁️  VLM model: {config['vlm_model']}")
+    console.print(f"   💬 LLM model: {config['llm_model']}")
+    console.print(f"   🌐 Jina API URL: {config['jina_api_base_url']}")
+    console.print(f"   🦙 Ollama URL: {config['ollama_base_url']}")
+    console.print("")
     
     # Test connections
     jina_api_url = config['jina_api_base_url']

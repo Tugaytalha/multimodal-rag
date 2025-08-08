@@ -1924,6 +1924,7 @@ Description:"""
             logger.warning(f"Error estimating page number: {e}")
             return 1
     
+    
     def _extract_text_elements(self, pdf_path: str) -> List[ExtractedElement]:
         """
         Extract text elements from PDF using regular PyMuPDF text extraction.
