@@ -7,6 +7,11 @@ from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 import hashlib
 import logging
+import chardet
+
+# Configure logging first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Document processing
 import fitz  # PyMuPDF for PDF processing
@@ -15,9 +20,23 @@ from docx.document import Document as DocxDocumentType
 from PIL import Image
 import pandas as pd
 
+# New format support
+try:
+    from striprtf.striprtf import rtf_to_text
+except ImportError:
+    rtf_to_text = None
+    logger.warning("striprtf not installed. RTF support will be limited.")
+
+try:
+    import markdown
+    from markdown.extensions import codehilite, tables
+except ImportError:
+    markdown = None
+    logger.warning("markdown not installed. Markdown support will be limited.")
+
 # Langchain components
 from langchain.schema.document import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownTextSplitter
 from langchain_chroma import Chroma
 
 # HTML processing for tables
@@ -28,9 +47,6 @@ import html2text
 from transformers import AutoProcessor, AutoModelForCausalLM, pipeline
 import torch
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 @dataclass
 class ExtractedElement:
@@ -49,20 +65,33 @@ class MultimodalDocumentProcessor:
     """
     
     def __init__(self, 
-                 vlm_model_name: str = "microsoft/git-base-coco",
+                 vlm_model_name: str = "gemma3:27b",
+                 llm_model_name: str = "gemma3:27b",
                  chunk_size: int = 800,
                  chunk_overlap: int = 80):
         """
         Initialize the multimodal document processor.
         
         Args:
-            vlm_model_name: Vision Language Model for image description
+            vlm_model_name: Vision Language Model for image description (default: gemma3:27b)
+            llm_model_name: Language Model for table descriptions (default: gemma3:27b)
             chunk_size: Text chunk size for splitting
             chunk_overlap: Overlap between text chunks
         """
-        self.vlm_model_name = vlm_model_name
+        # Ensure models are never None - use gemma3:27b as default
+        self.vlm_model_name = vlm_model_name if vlm_model_name is not None else "gemma3:27b"
+        self.llm_model_name = llm_model_name if llm_model_name is not None else "gemma3:27b"
+        
+        # Log warnings if None values were passed
+        if vlm_model_name is None:
+            logger.warning("VLM model was None, using default: gemma3:27b")
+        if llm_model_name is None:
+            logger.warning("LLM model was None, using default: gemma3:27b")
+        
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        
+        logger.info(f"Initializing document processor with VLM: {self.vlm_model_name}, LLM: {self.llm_model_name}")
         
         # Initialize text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -74,6 +103,9 @@ class MultimodalDocumentProcessor:
         
         # Initialize VLM for image description
         self._init_vlm()
+        
+        # Initialize LLM for table descriptions (optional)
+        self._init_llm()
         
         # Initialize HTML converter for tables
         self.html_converter = html2text.HTML2Text()
@@ -126,8 +158,63 @@ class MultimodalDocumentProcessor:
         except Exception as e:
             logger.error(f"Failed to load VLM model: {e}")
             self.vlm_model = None
-            self.vlm_processor = None
-            self.use_ollama_vlm = False
+    
+    def _init_llm(self):
+        """Initialize Language Model (LLM) for table descriptions."""
+        # Ensure we have a valid LLM model name
+        if not self.llm_model_name or self.llm_model_name.strip() == "":
+            self.llm_model_name = "gemma3:27b"
+            logger.warning("LLM model was empty/None, using default: gemma3:27b")
+        
+        try:
+            logger.info(f"Loading LLM model: {self.llm_model_name}")
+            
+            # Check if this is an Ollama model (contains colon or known Ollama models)
+            if (":" in self.llm_model_name or 
+                self.llm_model_name.startswith(("gemma", "llama", "mistral", "codellama"))):
+                
+                # Use Ollama for models like gemma3:27b, llama3.2:3b, etc.
+                logger.info(f"Using Ollama for LLM: {self.llm_model_name}")
+                
+                # Try different import options for Ollama
+                try:
+                    from langchain_ollama import OllamaLLM as Ollama
+                except ImportError:
+                    try:
+                        from langchain_community.llms import Ollama
+                    except ImportError:
+                        try:
+                            from langchain.llms import Ollama
+                        except ImportError:
+                            logger.error("Ollama not available. Please install langchain-ollama or langchain-community")
+                            self.llm_model = None
+                            return
+                
+                self.llm_model = Ollama(model=self.llm_model_name)
+                logger.info(f"Ollama LLM {self.llm_model_name} loaded successfully")
+                
+            else:
+                # Use HuggingFace for standard models
+                logger.info(f"Using HuggingFace for LLM: {self.llm_model_name}")
+                
+                # For now, use a simple text generation pipeline
+                # This can be extended to support more sophisticated models
+                try:
+                    self.llm_model = pipeline(
+                        "text-generation",
+                        model=self.llm_model_name,
+                        device=0 if torch.cuda.is_available() else -1,
+                        max_new_tokens=200,
+                        temperature=0.7
+                    )
+                    logger.info(f"HuggingFace LLM {self.llm_model_name} loaded successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to load HuggingFace LLM: {e}")
+                    self.llm_model = None
+                    
+        except Exception as e:
+            logger.error(f"Failed to load LLM model: {e}")
+            self.llm_model = None
     
     def _generate_element_id(self, content: Any, page_num: int, element_type: str) -> str:
         """Generate unique ID for extracted elements."""
@@ -164,7 +251,7 @@ class MultimodalDocumentProcessor:
             
             try:
                 # Create prompt for Ollama multimodal models
-                context_text = f"Context: {surrounding_text[:200]}" if surrounding_text else ""
+                context_text = f"Context: {surrounding_text}" if surrounding_text else ""
                 prompt = f"""Please describe this image in detail. Focus on the main subjects, activities, text content, charts, graphs, or any other important visual elements.
 
 {context_text}
@@ -204,7 +291,7 @@ What do you see in this image?"""
     def _describe_image_with_huggingface(self, image: Image.Image, surrounding_text: str = "") -> str:
         """Generate description using HuggingFace transformers."""
         try:
-            prompt_text = f"Describe this image in detail. Context: {surrounding_text[:200]}" if surrounding_text else "Describe this image in detail."
+            prompt_text = f"Describe this image in detail. Context: {surrounding_text}" if surrounding_text else "Describe this image in detail."
             
             # Different models have different input formats
             if "git" in self.vlm_model_name.lower():
@@ -256,20 +343,35 @@ What do you see in this image?"""
             Analyze the following table and provide a comprehensive description including:
             1. The main purpose and content of the table
             2. Key columns and their meanings
-            3. Important data patterns or trends
-            4. Any notable values or relationships
             
-            Context: {surrounding_text[:200]}
+            Context: {surrounding_text}
             
             Table:
-            {table_text[:1000]}
+            {table_text}
             
             Description:
             """
+
+            try: 
+                import ollama
+                response = ollama.chat(
+                    model=self.llm_model_name, # Use self.llm_model_name here
+                    messages=[{
+                        'role': 'user',
+                        'content': prompt,
+                    }]
+                )
+                description = response['message']['content']
+            except ImportError:
+                # Fallback to langchain if ollama library not available
+                # Note: This might not work for multimodal, depends on langchain implementation
+                logger.warning("ollama library not found, falling back to langchain (multimodal support limited)")
+                description = self.llm_model.invoke(prompt) # Use self.llm_model here
             
             # Use a simple text generation approach (can be replaced with more sophisticated LLM)
+            
             # For now, return a structured description
-            return f"Table containing {table_text.count('|')} columns with data about {surrounding_text[:100] if surrounding_text else 'various metrics'}. Full table content: {table_text[:500]}"
+            return description.strip()
             
         except Exception as e:
             logger.error(f"Error generating table description: {e}")
@@ -370,7 +472,7 @@ What do you see in this image?"""
                             img_path = self._save_image(image, image_dir, img_filename)
                             
                             # Generate description
-                            surrounding_text = text[:500] if text else ""
+                            surrounding_text = text if text else ""
                             description = self._describe_image_with_vlm(image, surrounding_text)
                             
                             # Determine if it's a graph or regular image
@@ -410,7 +512,7 @@ What do you see in this image?"""
                         table_html = df.to_html(index=False, escape=False)
                         
                         # Generate description
-                        surrounding_text = text[:500] if text else ""
+                        surrounding_text = text if text else ""
                         description = self._extract_table_description(table_html, surrounding_text)
                         
                         table_element = ExtractedElement(
@@ -497,7 +599,7 @@ What do you see in this image?"""
                         img_path = self._save_image(image, image_dir, img_filename)
                         
                         # Generate description
-                        description = self._describe_image_with_vlm(image, full_text[:500])
+                        description = self._describe_image_with_vlm(image, full_text)
                         
                         # Determine if it's a graph or regular image
                         is_graph = any(keyword in description.lower() 
@@ -512,7 +614,7 @@ What do you see in this image?"""
                                 "document_name": doc_name,
                                 "image_path": img_path,
                                 "description": description,
-                                "surrounding_text": full_text[:500],
+                                "surrounding_text": full_text,
                                 "content_type": element_type,
                                 "page": 1
                             },
@@ -537,7 +639,7 @@ What do you see in this image?"""
                     table_html = df.to_html(index=False, escape=False)
                     
                     # Generate description
-                    description = self._extract_table_description(table_html, full_text[:500])
+                    description = self._extract_table_description(table_html, full_text)
                     
                     table_element = ExtractedElement(
                         element_type="table",
@@ -546,7 +648,7 @@ What do you see in this image?"""
                             "source": docx_path,
                             "document_name": doc_name,
                             "description": description,
-                            "surrounding_text": full_text[:500],
+                            "surrounding_text": full_text,
                             "table_shape": df.shape,
                             "content_type": "table",
                             "page": 1
@@ -578,12 +680,886 @@ What do you see in this image?"""
         """
         file_extension = Path(file_path).suffix.lower()
         
+        # PDF processing
         if file_extension == '.pdf':
             return self.process_pdf(file_path, output_dir)
+        
+        # Word documents
         elif file_extension in ['.docx', '.doc']:
             return self.process_docx(file_path, output_dir)
+        
+        # Plain text files
+        elif file_extension == '.txt':
+            return self.process_txt(file_path, output_dir)
+        
+        # RTF files
+        elif file_extension == '.rtf':
+            return self.process_rtf(file_path, output_dir)
+        
+        # Spreadsheet files (convert to HTML like tables)
+        elif file_extension in ['.csv', '.xls', '.xlsx']:
+            return self.process_spreadsheet(file_path, output_dir)
+        
+        # JSON files
+        elif file_extension == '.json':
+            return self.process_json(file_path, output_dir)
+        
+        # Markdown files (with hierarchy-aware splitting)
+        elif file_extension in ['.md', '.markdown']:
+            return self.process_markdown(file_path, output_dir)
+        
+        # HTML files (similar to markdown)
+        elif file_extension in ['.html', '.htm']:
+            return self.process_html(file_path, output_dir)
+        
+        # Image files (process like images in PDF but without surrounding text)
+        elif file_extension in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']:
+            return self.process_image_file(file_path, output_dir)
+        
         else:
-            raise ValueError(f"Unsupported file format: {file_extension}")
+            raise ValueError(f"Unsupported file format: {file_extension}. Supported formats: .pdf, .doc, .docx, .txt, .rtf, .csv, .xls, .xlsx, .json, .md, .html, .jpg, .jpeg, .png")
+    
+    def process_txt(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Process TXT file with recursive text splitter and embedding.
+        
+        Args:
+            file_path: Path to TXT file
+            output_dir: Directory to save extracted content
+            
+        Returns:
+            List of extracted elements (text chunks)
+        """
+        logger.info(f"Processing TXT file: {file_path}")
+        
+        # Detect encoding
+        with open(file_path, 'rb') as f:
+            raw_data = f.read()
+            encoding_result = chardet.detect(raw_data)
+            encoding = encoding_result.get('encoding', 'utf-8')
+        
+        # Read text content
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                text_content = f.read()
+        except UnicodeDecodeError:
+            # Fallback to utf-8 with error handling
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text_content = f.read()
+                
+        if not text_content.strip():
+            logger.warning(f"Empty or whitespace-only content in {file_path}")
+            return []
+        
+        # Use recursive text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        
+        text_chunks = text_splitter.split_text(text_content)
+        
+        elements = []
+        file_name = Path(file_path).name
+        
+        for i, chunk in enumerate(text_chunks):
+            if chunk.strip():  # Skip empty chunks
+                element_id = f"{file_name}_txt_chunk_{i}"
+                
+                elements.append(ExtractedElement(
+                    element_type="text",
+                    content=chunk,
+                    metadata={
+                        "source_file": file_name,
+                        "file_type": "txt",
+                        "chunk_index": i,
+                        "total_chunks": len(text_chunks),
+                        "encoding": encoding
+                    },
+                    page_number=1,  # TXT files don't have pages
+                    element_id=element_id
+                ))
+        
+        logger.info(f"Extracted {len(elements)} text chunks from {file_path}")
+        return elements
+    
+    def process_rtf(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Process RTF file by converting to text and then processing like TXT.
+        
+        Args:
+            file_path: Path to RTF file
+            output_dir: Directory to save extracted content
+            
+        Returns:
+            List of extracted elements (text chunks)
+        """
+        logger.info(f"Processing RTF file: {file_path}")
+        
+        if rtf_to_text is None:
+            logger.error("striprtf library not available. Cannot process RTF files.")
+            raise ImportError("striprtf library required for RTF processing. Install with: pip install striprtf")
+        
+        # Read RTF file and convert to text
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                rtf_content = f.read()
+        except UnicodeDecodeError:
+            # Try with different encoding
+            with open(file_path, 'r', encoding='cp1252', errors='ignore') as f:
+                rtf_content = f.read()
+        
+        # Convert RTF to plain text
+        try:
+            text_content = rtf_to_text(rtf_content)
+        except Exception as e:
+            logger.error(f"Failed to parse RTF content: {e}")
+            return []
+            
+        if not text_content.strip():
+            logger.warning(f"Empty or whitespace-only content after RTF conversion in {file_path}")
+            return []
+        
+        # Use recursive text splitter (same as TXT processing)
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        
+        text_chunks = text_splitter.split_text(text_content)
+        
+        elements = []
+        file_name = Path(file_path).name
+        
+        for i, chunk in enumerate(text_chunks):
+            if chunk.strip():  # Skip empty chunks
+                element_id = f"{file_name}_rtf_chunk_{i}"
+                
+                elements.append(ExtractedElement(
+                    element_type="text",
+                    content=chunk,
+                    metadata={
+                        "source_file": file_name,
+                        "file_type": "rtf",
+                        "chunk_index": i,
+                        "total_chunks": len(text_chunks),
+                        "original_format": "rtf"
+                    },
+                    page_number=1,  # RTF files don't have clear page structure
+                    element_id=element_id
+                ))
+        
+        logger.info(f"Extracted {len(elements)} text chunks from RTF file {file_path}")
+        return elements
+    
+    def process_spreadsheet(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Process spreadsheet files (CSV, XLS, XLSX) by converting to HTML format like tables.
+        
+        Args:
+            file_path: Path to spreadsheet file
+            output_dir: Directory to save extracted content
+            
+        Returns:
+            List of extracted elements (table elements)
+        """
+        logger.info(f"Processing spreadsheet file: {file_path}")
+        
+        file_extension = Path(file_path).suffix.lower()
+        file_name = Path(file_path).name
+        
+        try:
+            # Read spreadsheet based on format
+            if file_extension == '.csv':
+                # Try to detect encoding for CSV
+                with open(file_path, 'rb') as f:
+                    raw_data = f.read()
+                    encoding_result = chardet.detect(raw_data)
+                    encoding = encoding_result.get('encoding', 'utf-8')
+                
+                df = pd.read_csv(file_path, encoding=encoding)
+                
+            elif file_extension in ['.xls', '.xlsx']:
+                # Read Excel file, handle multiple sheets
+                excel_file = pd.ExcelFile(file_path)
+                
+                elements = []
+                for sheet_idx, sheet_name in enumerate(excel_file.sheet_names):
+                    df = pd.read_excel(file_path, sheet_name=sheet_name)
+                    
+                    # Skip empty sheets
+                    if df.empty:
+                        logger.warning(f"Empty sheet '{sheet_name}' in {file_path}")
+                        continue
+                    
+                    # Convert DataFrame to HTML
+                    html_content = df.to_html(
+                        index=False, 
+                        classes='spreadsheet-table',
+                        table_id=f'sheet_{sheet_idx}',
+                        escape=False
+                    )
+                    
+                    # Generate description using LLM (like tables in PDF)
+                    description = self._describe_table_with_llm(df, sheet_name)
+                    
+                    element_id = f"{file_name}_sheet_{sheet_idx}_{sheet_name}"
+                    
+                    elements.append(ExtractedElement(
+                        element_type="table",
+                        content=description,  # Store description for embedding
+                        metadata={
+                            "source_file": file_name,
+                            "file_type": file_extension[1:],  # Remove dot
+                            "sheet_name": sheet_name,
+                            "sheet_index": sheet_idx,
+                            "table_html": html_content,
+                            "table_shape": df.shape,
+                            "columns": df.columns.tolist()
+                        },
+                        page_number=sheet_idx + 1,  # Use sheet number as page
+                        element_id=element_id
+                    ))
+                
+                logger.info(f"Extracted {len(elements)} tables from {len(excel_file.sheet_names)} sheets in {file_path}")
+                return elements
+            
+            else:
+                raise ValueError(f"Unsupported spreadsheet format: {file_extension}")
+            
+            # For CSV files (single sheet)
+            if df.empty:
+                logger.warning(f"Empty spreadsheet file: {file_path}")
+                return []
+            
+            # Convert DataFrame to HTML
+            html_content = df.to_html(
+                index=False, 
+                classes='spreadsheet-table',
+                escape=False
+            )
+            
+            # Generate description using LLM (like tables in PDF)
+            description = self._describe_table_with_llm(df, file_name)
+            
+            element_id = f"{file_name}_table_0"
+            
+            element = ExtractedElement(
+                element_type="table",
+                content=description,  # Store description for embedding
+                metadata={
+                    "source_file": file_name,
+                    "file_type": file_extension[1:],  # Remove dot
+                    "table_html": html_content,
+                    "table_shape": df.shape,
+                    "columns": df.columns.tolist(),
+                    "encoding": encoding if file_extension == '.csv' else None
+                },
+                page_number=1,
+                element_id=element_id
+            )
+            
+            logger.info(f"Extracted 1 table from spreadsheet {file_path}")
+            return [element]
+            
+        except Exception as e:
+            logger.error(f"Error processing spreadsheet {file_path}: {e}")
+            return []
+    
+    def _describe_table_with_llm(self, df: pd.DataFrame, table_name: str) -> str:
+        """
+        Generate a description of the table using LLM (similar to table processing in PDF).
+        
+        Args:
+            df: DataFrame containing table data
+            table_name: Name/identifier for the table
+            
+        Returns:
+            Text description of the table
+        """
+        try:
+            # Create a summary of the table structure and content
+            table_info = f"Table: {table_name}\n"
+            table_info += f"Shape: {df.shape[0]} rows, {df.shape[1]} columns\n"
+            table_info += f"Columns: {', '.join(df.columns.tolist())}\n\n"
+            
+            # Add a sample of the data (first few rows)
+            sample_rows = min(5, len(df))
+            table_info += f"Sample data (first {sample_rows} rows):\n"
+            table_info += df.head(sample_rows).to_string(index=False)
+            
+            # Generate description using LLM
+            prompt = f"""Analyze this spreadsheet table and provide a concise description of its content, structure, and key information:
+
+{table_info}
+
+Please provide a brief but informative description that captures:
+1. What type of data this table contains
+2. Key columns and their purpose
+
+Description:"""
+
+            if self.llm_model:
+                try:
+                    response = self.llm_model.invoke(prompt)
+                    return response.strip() if hasattr(response, 'strip') else str(response).strip()
+                except Exception as e:
+                    logger.warning(f"LLM description failed for table {table_name}: {e}")
+            
+            # Fallback: return basic description
+            return f"Spreadsheet table '{table_name}' with {df.shape[0]} rows and {df.shape[1]} columns. Columns: {', '.join(df.columns.tolist())}. Contains structured data suitable for analysis."
+            
+        except Exception as e:
+            logger.error(f"Error generating table description for {table_name}: {e}")
+            return f"Spreadsheet table: {table_name}"
+    
+    def process_json(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Process JSON files by parsing structure and creating text representations.
+        
+        Args:
+            file_path: Path to JSON file
+            output_dir: Directory to save extracted content
+            
+        Returns:
+            List of extracted elements (text or table elements)
+        """
+        logger.info(f"Processing JSON file: {file_path}")
+        
+        file_name = Path(file_path).name
+        
+        try:
+            # Read JSON file
+            with open(file_path, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+        except UnicodeDecodeError:
+            # Try with different encoding
+            with open(file_path, 'r', encoding='cp1252', errors='ignore') as f:
+                json_data = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON format in {file_path}: {e}")
+            return []
+        
+        elements = []
+        
+        # Strategy 1: If JSON is a list of similar objects (like a table)
+        if isinstance(json_data, list) and len(json_data) > 0:
+            if all(isinstance(item, dict) for item in json_data):
+                # Convert list of dicts to DataFrame for table-like processing
+                try:
+                    df = pd.DataFrame(json_data)
+                    
+                    # Convert DataFrame to HTML
+                    html_content = df.to_html(
+                        index=False, 
+                        classes='json-table',
+                        escape=False
+                    )
+                    
+                    # Generate description using LLM
+                    description = self._describe_table_with_llm(df, f"JSON data from {file_name}")
+                    
+                    element_id = f"{file_name}_json_table_0"
+                    
+                    elements.append(ExtractedElement(
+                        element_type="table",
+                        content=description,
+                        metadata={
+                            "source_file": file_name,
+                            "file_type": "json",
+                            "data_type": "list_of_objects",
+                            "table_html": html_content,
+                            "table_shape": df.shape,
+                            "columns": df.columns.tolist() if hasattr(df, 'columns') else []
+                        },
+                        page_number=1,
+                        element_id=element_id
+                    ))
+                    
+                    logger.info(f"Processed JSON as table with {df.shape[0]} rows and {df.shape[1]} columns")
+                    return elements
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to convert JSON list to table: {e}, falling back to text processing")
+        
+        # Strategy 2: Process as structured text
+        # Create a readable text representation of the JSON
+        def json_to_readable_text(obj, indent_level=0):
+            """Convert JSON object to readable text format."""
+            indent = "  " * indent_level
+            
+            if isinstance(obj, dict):
+                if not obj:
+                    return "{}"
+                text = indent + "{\n"
+                for key, value in obj.items():
+                    text += f"{indent}  {key}: "
+                    if isinstance(value, (dict, list)):
+                        text += "\n" + json_to_readable_text(value, indent_level + 1)
+                    else:
+                        text += str(value)
+                    text += "\n"
+                text += f"{indent}}}"
+                return text
+                
+            elif isinstance(obj, list):
+                if not obj:
+                    return "[]"
+                text = indent + "[\n"
+                for i, item in enumerate(obj):
+                    text += f"{indent}  Item {i + 1}: "
+                    if isinstance(item, (dict, list)):
+                        text += "\n" + json_to_readable_text(item, indent_level + 1)
+                    else:
+                        text += str(item)
+                    text += "\n"
+                text += f"{indent}]"
+                return text
+                
+            else:
+                return str(obj)
+        
+        # Convert JSON to readable text
+        readable_text = json_to_readable_text(json_data)
+        
+        # Create a summary description
+        summary = self._create_json_summary(json_data, file_name)
+        
+        # Split the readable text into chunks if it's too long
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1500,  # Larger chunks for structured data
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", "}", "]", ",", " "]
+        )
+        
+        # Combine summary and readable text
+        full_text = f"JSON File Summary:\n{summary}\n\nDetailed Structure:\n{readable_text}"
+        text_chunks = text_splitter.split_text(full_text)
+        
+        for i, chunk in enumerate(text_chunks):
+            if chunk.strip():
+                element_id = f"{file_name}_json_chunk_{i}"
+                
+                elements.append(ExtractedElement(
+                    element_type="text",
+                    content=chunk,
+                    metadata={
+                        "source_file": file_name,
+                        "file_type": "json",
+                        "data_type": type(json_data).__name__,
+                        "chunk_index": i,
+                        "total_chunks": len(text_chunks),
+                        "is_structured_data": True
+                    },
+                    page_number=1,
+                    element_id=element_id
+                ))
+        
+        logger.info(f"Processed JSON file into {len(elements)} text chunks")
+        return elements
+    
+    def _create_json_summary(self, json_data, file_name: str) -> str:
+        """Create a summary of JSON file structure and content."""
+        try:
+            summary = f"JSON file: {file_name}\n"
+            
+            if isinstance(json_data, dict):
+                summary += f"Type: Dictionary with {len(json_data)} keys\n"
+                summary += f"Keys: {', '.join(list(json_data.keys())[:10])}"  # First 10 keys
+                if len(json_data) > 10:
+                    summary += " ..."
+                    
+            elif isinstance(json_data, list):
+                summary += f"Type: List with {len(json_data)} items\n"
+                if json_data and isinstance(json_data[0], dict):
+                    summary += f"List contains dictionaries with keys: {', '.join(list(json_data[0].keys())[:5])}"
+                else:
+                    summary += f"List contains {type(json_data[0]).__name__} items"
+                    
+            else:
+                summary += f"Type: {type(json_data).__name__}\n"
+                summary += f"Value: {str(json_data)[:100]}"
+                
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error creating JSON summary: {e}")
+            return f"JSON file: {file_name} (summary generation failed)"
+    
+    def process_markdown(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Process Markdown files with hierarchy-aware splitting (# -> ## -> ### -> ... -> \n\n -> \n).
+        For images, use surrounding text (text before and after), preserving order.
+        
+        Args:
+            file_path: Path to Markdown file
+            output_dir: Directory to save extracted content
+            
+        Returns:
+            List of extracted elements (text chunks and images)
+        """
+        logger.info(f"Processing Markdown file: {file_path}")
+        
+        # Read Markdown file
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                markdown_content = f.read()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                markdown_content = f.read()
+                
+        if not markdown_content.strip():
+            logger.warning(f"Empty or whitespace-only content in {file_path}")
+            return []
+        
+        elements = []
+        file_name = Path(file_path).name
+        
+        # Extract images from markdown first
+        import re
+        image_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+        images_found = list(re.finditer(image_pattern, markdown_content))
+        
+        # Process images with surrounding text
+        for img_match in images_found:
+            alt_text = img_match.group(1)
+            img_src = img_match.group(2)
+            img_start = img_match.start()
+            img_end = img_match.end()
+            
+            # Get surrounding text (before and after the image)
+            context_range = 200  # Characters before and after
+            text_before = markdown_content[max(0, img_start - context_range):img_start].strip()
+            text_after = markdown_content[img_end:min(len(markdown_content), img_end + context_range)].strip()
+            surrounding_text = f"{text_before} [IMAGE: {alt_text}] {text_after}".strip()
+            
+            # Try to process the image if it's a local file
+            try:
+                # Handle relative paths and local images
+                if not img_src.startswith(('http://', 'https://', 'ftp://')):
+                    # Local image file
+                    img_full_path = os.path.join(os.path.dirname(file_path), img_src)
+                    if os.path.exists(img_full_path):
+                        image = Image.open(img_full_path)
+                        
+                        # Save image to output directory
+                        image_dir = os.path.join(output_dir, "images")
+                        os.makedirs(image_dir, exist_ok=True)
+                        image_filename = f"{file_name}_{len(elements)}_{Path(img_src).name}"
+                        image_path = os.path.join(image_dir, image_filename)
+                        image.save(image_path)
+                        
+                        # Generate description with surrounding text
+                        description = self._describe_image_with_vlm(image, surrounding_text)
+                        
+                        # Determine if it's a graph or regular image
+                        is_graph = any(keyword in description.lower() 
+                                     for keyword in ['chart', 'graph', 'plot', 'diagram', 'visualization'])
+                        element_type = "graph" if is_graph else "image"
+                        
+                        img_element = ExtractedElement(
+                            element_type=element_type,
+                            content=description,  # Store description for embedding
+                            metadata={
+                                "source_file": file_name,
+                                "file_type": "md",
+                                "image_path": image_path,
+                                "alt_text": alt_text,
+                                "original_src": img_src,
+                                "surrounding_text": surrounding_text,
+                                "markdown_context": True
+                            },
+                            page_number=1,
+                            element_id=f"{file_name}_img_{len(elements)}"
+                        )
+                        elements.append(img_element)
+                        
+            except Exception as e:
+                logger.warning(f"Could not process image {img_src} in markdown: {e}")
+        
+        # Remove image markdown syntax for text processing
+        text_content = re.sub(image_pattern, '', markdown_content)
+        
+        # Use MarkdownTextSplitter with hierarchy awareness
+        if markdown is not None:
+            # Use markdown-aware splitter
+            markdown_splitter = MarkdownTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200
+            )
+        else:
+            # Fallback to regular text splitter with markdown-like separators
+            markdown_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                separators=[
+                    "\n# ",      # H1
+                    "\n## ",     # H2
+                    "\n### ",    # H3
+                    "\n#### ",   # H4
+                    "\n##### ",  # H5
+                    "\n###### ", # H6
+                    "\n\n",      # Paragraphs
+                    "\n",        # Lines
+                    " ",         # Words
+                    ""           # Characters
+                ]
+            )
+        
+        text_chunks = markdown_splitter.split_text(text_content)
+        
+        for i, chunk in enumerate(text_chunks):
+            if chunk.strip():  # Skip empty chunks
+                element_id = f"{file_name}_md_chunk_{i}"
+                
+                elements.append(ExtractedElement(
+                    element_type="text",
+                    content=chunk,
+                    metadata={
+                        "source_file": file_name,
+                        "file_type": "md",
+                        "chunk_index": i,
+                        "total_chunks": len(text_chunks),
+                        "is_markdown": True
+                    },
+                    page_number=1,
+                    element_id=element_id
+                ))
+        
+        logger.info(f"Extracted {len(elements)} elements from Markdown file {file_path}")
+        return elements
+    
+    def process_html(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Process HTML files by parsing content and extracting text and images (similar to markdown).
+        
+        Args:
+            file_path: Path to HTML file
+            output_dir: Directory to save extracted content
+            
+        Returns:
+            List of extracted elements (text chunks and images)
+        """
+        logger.info(f"Processing HTML file: {file_path}")
+        
+        # Read HTML file
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                html_content = f.read()
+                
+        if not html_content.strip():
+            logger.warning(f"Empty or whitespace-only content in {file_path}")
+            return []
+        
+        elements = []
+        file_name = Path(file_path).name
+        
+        # Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Extract images from HTML
+        images = soup.find_all('img')
+        for img_idx, img_tag in enumerate(images):
+            img_src = img_tag.get('src', '')
+            alt_text = img_tag.get('alt', '')
+            
+            # Get surrounding text (previous and next siblings)
+            context_elements = []
+            
+            # Get previous siblings (up to 2)
+            prev_siblings = []
+            for sibling in img_tag.previous_siblings:
+                if hasattr(sibling, 'get_text'):
+                    prev_siblings.append(sibling.get_text().strip())
+                elif isinstance(sibling, str):
+                    prev_siblings.append(sibling.strip())
+                if len(prev_siblings) >= 2:
+                    break
+            
+            # Get next siblings (up to 2) 
+            next_siblings = []
+            for sibling in img_tag.next_siblings:
+                if hasattr(sibling, 'get_text'):
+                    next_siblings.append(sibling.get_text().strip())
+                elif isinstance(sibling, str):
+                    next_siblings.append(sibling.strip())
+                if len(next_siblings) >= 2:
+                    break
+            
+            surrounding_text = ' '.join(reversed(prev_siblings)) + f" [IMAGE: {alt_text}] " + ' '.join(next_siblings)
+            surrounding_text = surrounding_text.strip()
+            
+            # Try to process the image if it's a local file
+            try:
+                if not img_src.startswith(('http://', 'https://', 'ftp://', 'data:')):
+                    # Local image file
+                    img_full_path = os.path.join(os.path.dirname(file_path), img_src)
+                    if os.path.exists(img_full_path):
+                        image = Image.open(img_full_path)
+                        
+                        # Save image to output directory
+                        image_dir = os.path.join(output_dir, "images")
+                        os.makedirs(image_dir, exist_ok=True)
+                        image_filename = f"{file_name}_{img_idx}_{Path(img_src).name}"
+                        image_path = os.path.join(image_dir, image_filename)
+                        image.save(image_path)
+                        
+                        # Generate description with surrounding text
+                        description = self._describe_image_with_vlm(image, surrounding_text)
+                        
+                        # Determine if it's a graph or regular image
+                        is_graph = any(keyword in description.lower() 
+                                     for keyword in ['chart', 'graph', 'plot', 'diagram', 'visualization'])
+                        element_type = "graph" if is_graph else "image"
+                        
+                        img_element = ExtractedElement(
+                            element_type=element_type,
+                            content=description,  # Store description for embedding
+                            metadata={
+                                "source_file": file_name,
+                                "file_type": "html",
+                                "image_path": image_path,
+                                "alt_text": alt_text,
+                                "original_src": img_src,
+                                "surrounding_text": surrounding_text,
+                                "html_context": True
+                            },
+                            page_number=1,
+                            element_id=f"{file_name}_img_{img_idx}"
+                        )
+                        elements.append(img_element)
+                        
+            except Exception as e:
+                logger.warning(f"Could not process image {img_src} in HTML: {e}")
+        
+        # Convert HTML to text while preserving structure
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True  # We already processed images separately
+        h.body_width = 0  # Don't wrap lines
+        
+        text_content = h.handle(html_content)
+        
+        # Use recursive text splitter with HTML-aware separators
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=[
+                "\n# ",      # H1 (from html2text conversion)
+                "\n## ",     # H2
+                "\n### ",    # H3
+                "\n#### ",   # H4
+                "\n##### ",  # H5
+                "\n###### ", # H6
+                "\n\n",      # Paragraphs
+                "\n",        # Lines
+                " ",         # Words
+                ""           # Characters
+            ]
+        )
+        
+        text_chunks = text_splitter.split_text(text_content)
+        
+        for i, chunk in enumerate(text_chunks):
+            if chunk.strip():  # Skip empty chunks
+                element_id = f"{file_name}_html_chunk_{i}"
+                
+                elements.append(ExtractedElement(
+                    element_type="text",
+                    content=chunk,
+                    metadata={
+                        "source_file": file_name,
+                        "file_type": "html",
+                        "chunk_index": i,
+                        "total_chunks": len(text_chunks),
+                        "is_html": True
+                    },
+                    page_number=1,
+                    element_id=element_id
+                ))
+        
+        logger.info(f"Extracted {len(elements)} elements from HTML file {file_path}")
+        return elements
+    
+    def process_image_file(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Process standalone image files (JPEG, PNG, etc.) like images in PDF but without surrounding text.
+        
+        Args:
+            file_path: Path to image file
+            output_dir: Directory to save extracted content
+            
+        Returns:
+            List of extracted elements (single image element)
+        """
+        logger.info(f"Processing standalone image file: {file_path}")
+        
+        try:
+            # Open and validate image
+            image = Image.open(file_path)
+            
+            # Save image to output directory
+            image_dir = os.path.join(output_dir, "images")
+            os.makedirs(image_dir, exist_ok=True)
+            image_filename = Path(file_path).name
+            image_output_path = os.path.join(image_dir, image_filename)
+            
+            # Save in a common format if needed
+            if image.mode in ('RGBA', 'LA', 'P'):
+                # Convert to RGB for better compatibility
+                rgb_image = Image.new('RGB', image.size, (255, 255, 255))
+                if image.mode == 'P':
+                    image = image.convert('RGBA')
+                rgb_image.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+                image = rgb_image
+            
+            image.save(image_output_path)
+            
+            # Generate description without surrounding text (as specified)
+            surrounding_text = ""  # No surrounding text for standalone images
+            description = self._describe_image_with_vlm(image, surrounding_text)
+            
+            # Determine if it's a graph or regular image based on content
+            is_graph = any(keyword in description.lower() 
+                         for keyword in ['chart', 'graph', 'plot', 'diagram', 'visualization', 
+                                       'data', 'statistics', 'analytics', 'metrics'])
+            element_type = "graph" if is_graph else "image"
+            
+            file_name = Path(file_path).name
+            element_id = self._generate_element_id(file_name, 1, element_type)
+            
+            img_element = ExtractedElement(
+                element_type=element_type,
+                content=description,  # Store description for embedding
+                metadata={
+                    "source_file": file_name,
+                    "file_type": Path(file_path).suffix[1:].lower(),  # Extension without dot
+                    "image_path": image_output_path,
+                    "original_path": file_path,
+                    "image_size": image.size,
+                    "image_mode": image.mode,
+                    "standalone_image": True,
+                    "surrounding_text": surrounding_text  # Empty for standalone images
+                },
+                page_number=1,
+                element_id=element_id,
+                bbox=None  # No bounding box for standalone images
+            )
+            
+            logger.info(f"Processed standalone image {file_path} as {element_type}")
+            return [img_element]
+            
+        except Exception as e:
+            logger.error(f"Error processing standalone image file {file_path}: {e}")
+            return []
     
     def elements_to_documents(self, elements: List[ExtractedElement]) -> List[Document]:
         """
