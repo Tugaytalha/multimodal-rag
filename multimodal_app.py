@@ -8,10 +8,9 @@ from shutil import copy2
 import logging
 
 # Custom modules
-try:
-    from multimodal_rag_system import create_multimodal_rag_system, MultimodalRAGSystem
-except ImportError:
-    from multimodal_rag_system import create_multimodal_rag_system, MultimodalRAGSystem
+from multimodal_rag_system import create_multimodal_rag_system, MultimodalRAGSystem
+from config import (get_default_config, TEXT_EMBEDDING_MODELS, MULTIMODAL_EMBEDDING_MODELS, 
+                   DEFAULT_LLM_MODEL, DEFAULT_VLM_MODEL)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -76,9 +75,13 @@ else:
         "mistral:7b",
     ]
 
-# Determine default LLM and VLM models
-DEFAULT_LLM_MODEL = "gemma3:latest" if "gemma3:latest" in LLM_MODELS else LLM_MODELS[0]
-DEFAULT_VLM_MODEL = "gemma3:latest" if "gemma3:latest" in VLM_MODELS else VLM_MODELS[0]
+# Determine default LLM and VLM models - always prefer gemma3:27b
+DEFAULT_LLM_MODEL_UI = DEFAULT_LLM_MODEL if DEFAULT_LLM_MODEL in LLM_MODELS else (
+    "gemma3:27b" if "gemma3:27b" in LLM_MODELS else LLM_MODELS[0] if LLM_MODELS else "gemma3:27b"
+)
+DEFAULT_VLM_MODEL_UI = DEFAULT_VLM_MODEL if DEFAULT_VLM_MODEL in VLM_MODELS else (
+    "gemma3:27b" if "gemma3:27b" in VLM_MODELS else VLM_MODELS[0] if VLM_MODELS else "gemma3:27b"
+)
 # ------------------------
 
 RETRIEVAL_STRATEGIES = [
@@ -96,20 +99,31 @@ def initialize_rag_system(text_embedding_model: str,
                          multimodal_embedding_model: str,
                          vlm_model: str,
                          llm_model: str,
-                         jina_api_key: str = None):
+                         jina_api_key: str = None,
+                         force_local: bool = False):
     """Initialize the RAG system with given parameters."""
     global rag_system
     
-    config = {
+    # Get default config and update with Gradio settings
+    config = get_default_config()
+    config.update({
         "text_embedding_model": text_embedding_model,
         "multimodal_embedding_model": multimodal_embedding_model,
         "vlm_model": vlm_model,
         "llm_model": llm_model,
-        "jina_api_key": jina_api_key if jina_api_key else None
-    }
+        "jina_api_key": jina_api_key,
+        "force_local_embeddings": force_local
+    })
     
-    rag_system = create_multimodal_rag_system(config)
-    return rag_system
+    logger.info("🔧 Initializing multimodal RAG system...")
+    
+    try:
+        rag_system = create_multimodal_rag_system(config)
+        logger.info("✅ System initialized successfully!")
+        return "System initialized successfully!", rag_system.get_database_stats()
+    except Exception as e:
+        logger.error(f"❌ System initialization failed: {e}")
+        return f"System initialization failed: {e}", {}
 
 def process_query(
     question: str,
@@ -352,7 +366,7 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                         with gr.Column():
                             llm_model = gr.Dropdown(
                                 choices=LLM_MODELS,
-                                value=DEFAULT_LLM_MODEL,
+                                value=DEFAULT_LLM_MODEL_UI,
                                 label="💬 LLM Model",
                                 info="Language model for response generation"
                             )
@@ -374,7 +388,7 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                             
                             vlm_model = gr.Dropdown(
                                 choices=VLM_MODELS,
-                                value=DEFAULT_VLM_MODEL,
+                                value=DEFAULT_VLM_MODEL_UI,
                                 label="👁️ Vision Language Model",
                                 info="Model for describing images and graphs"
                             )
@@ -500,13 +514,13 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                     
                     db_vlm_dropdown = gr.Dropdown(
                         choices=VLM_MODELS,
-                        value=DEFAULT_VLM_MODEL,
+                        value=DEFAULT_VLM_MODEL_UI,
                         label="Vision Language Model"
                     )
                     
                     db_llm_dropdown = gr.Dropdown(
                         choices=LLM_MODELS,
-                        value=DEFAULT_LLM_MODEL,
+                        value=DEFAULT_LLM_MODEL_UI,
                         label="LLM Model"
                     )
                     
