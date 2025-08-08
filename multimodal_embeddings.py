@@ -39,245 +39,176 @@ class MultimodalEmbeddingBase(ABC):
         """Embed a query text."""
         pass
 
-class JinaMultimodalEmbeddings(MultimodalEmbeddingBase):
+class JinaMultimodalEmbeddings:
     """
-    Jina multimodal embeddings (jina-embeddings-v4) for handling both text and images.
-    Supports both official Jina API and custom API endpoints with flexible configuration.
+    Jina multimodal embedding model that supports both text and image embeddings
+    using only on-premises API endpoints.
     """
     
     def __init__(self, 
                  model_name: str = "jinaai/jina-embeddings-v4",
-                 api_key: Optional[str] = None,
                  api_base_url: Optional[str] = None,
-                 force_api: bool = False,
                  force_local: bool = False):
         """
-        Initialize Jina multimodal embeddings.
+        Initialize Jina multimodal embeddings for on-premises use only.
         
         Args:
             model_name: Jina model name
-            api_key: Jina API key (if using API)
-            api_base_url: Custom API base URL (e.g., "http://10.144.100.204:38044")
-                         If None, uses official Jina API: "https://api.jina.ai/v1/embeddings"
-            force_api: Force using API even without API key (for custom endpoints)
-            force_local: Force using local model (overrides API settings)
+            api_base_url: On-premises API base URL (e.g., "http://10.144.100.204:38044")
+            force_local: Force using local model instead of API
         """
         self.model_name = model_name
-        self.api_key = api_key or os.getenv("JINA_API_KEY")
         
-        # Determine API configuration
-        if api_base_url:
-            # Custom API endpoint (like user's setup)
+        # Determine API configuration - only on-premises
+        if api_base_url and not force_local:
+            # On-premises API endpoint
             self.api_base_url = api_base_url.rstrip('/')
-            self.use_custom_api = True
+            self.use_api = True
             self.text_embed_url = f"{self.api_base_url}/embed/text"
             self.image_embed_url = f"{self.api_base_url}/embed/image"
+            logger.info(f"Using on-premises API at {self.api_base_url}")
         else:
-            # Official Jina API
-            self.api_base_url = "https://api.jina.ai/v1/embeddings"
-            self.use_custom_api = False
-            self.text_embed_url = self.api_base_url
-            self.image_embed_url = self.api_base_url
-        
-        # Determine whether to use API or local model
-        if force_local:
-            logger.info("Forcing local CLIP model usage")
-            self.use_api = False
-            self._init_local_clip()
-        elif force_api or self.use_custom_api:
-            if self.use_custom_api:
-                logger.info(f"Using custom API at {self.api_base_url}")
-            else:
-                logger.info("Using official Jina API for multimodal embeddings")
-            self.use_api = True
-        elif self.api_key:
-            logger.info("Using official Jina API for multimodal embeddings")
-            self.use_api = True
-        else:
-            logger.warning("No Jina API key found and no custom API specified. Falling back to local CLIP model.")
+            # Local CLIP model fallback
+            logger.info("Using local CLIP model for embeddings")
             self.use_api = False
             self._init_local_clip()
     
     def _init_local_clip(self):
         """Initialize local CLIP model as fallback."""
         try:
-            self.use_api = False
-            self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-            self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            from sentence_transformers import SentenceTransformer
+            import torch
+            
+            # Use a reliable local CLIP model
+            self.clip_model = SentenceTransformer("openai/clip-vit-base-patch32")
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.clip_model.to(self.device)
             logger.info(f"Local CLIP model loaded on {self.device}")
         except Exception as e:
             logger.error(f"Failed to load local CLIP model: {e}")
-            raise
+            raise ImportError("Failed to initialize local CLIP model. Please install sentence-transformers.")
     
-    def _image_to_base64(self, image_path: str) -> str:
-        """Convert image to base64 string."""
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
-    
-    def _embed_text_with_custom_api(self, texts: List[str]) -> List[List[float]]:
-        """Embed texts using custom API format (like user's test code)."""
+    def _embed_text_with_api(self, texts: List[str]) -> List[List[float]]:
+        """Embed text using on-premises API."""
         if not texts:
             return []
             
-        payload = {
-            "model": self.model_name,
-            "texts": texts,
-            "task": "retrieval",
-            "prompt_name": "query"
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        
-        try:
-            response = requests.post(self.text_embed_url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            
-            result = response.json()
-            return result["embeddings"]
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Custom API text embedding failed: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response content: {e.response.text}")
-            raise
-    
-    def _embed_images_with_custom_api(self, image_paths: List[str], queries: List[str] = None) -> List[List[float]]:
-        """Embed images using custom API format (like user's test code)."""
-        if not image_paths:
-            return []
-            
-        # Convert images to base64
-        images_base64 = []
-        for image_path in image_paths:
-            try:
-                images_base64.append(self._image_to_base64(image_path))
-            except Exception as e:
-                logger.error(f"Failed to encode image {image_path}: {e}")
-                continue
-        
-        if not images_base64:
-            return []
-        
-        # Use default queries if none provided
-        if queries is None:
-            queries = ["What is in this image?" for _ in images_base64]
-        
-        payload = {
-            "model": self.model_name,
-            "queries": queries,
-            "images_base64": images_base64
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        
-        try:
-            response = requests.post(self.image_embed_url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            
-            result = response.json()
-            # Return image embeddings (not query embeddings)
-            return result["image_embeddings"]
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Custom API image embedding failed: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response content: {e.response.text}")
-            raise
-    
-    def _embed_with_official_api(self, inputs: List[Dict[str, Any]]) -> List[List[float]]:
-        """Embed using official Jina API format."""
-        if not inputs:
-            return []
-            
         headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
+            "Content-Type": "application/json"
         }
         
         data = {
-            "model": self.model_name,
-            "input": inputs,
-            "encoding_format": "float"
+            "texts": texts
         }
         
         try:
-            response = requests.post(self.api_base_url, headers=headers, json=data, timeout=30)
+            response = requests.post(self.text_embed_url, headers=headers, json=data, timeout=30)
             response.raise_for_status()
             
             result = response.json()
-            return [item["embedding"] for item in result["data"]]
+            # Return text embeddings based on on-premises API format
+            return result.get("embeddings", [])
         except requests.exceptions.RequestException as e:
-            logger.error(f"Official Jina API request failed: {e}")
+            logger.error(f"On-premises text embedding API failed: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response content: {e.response.text}")
+            raise
+    
+    def _embed_images_with_api(self, image_paths: List[str]) -> List[List[float]]:
+        """Embed images using on-premises API."""
+        if not image_paths:
+            return []
+            
+        # Convert images to base64 for API
+        images_data = []
+        for img_path in image_paths:
+            try:
+                with open(img_path, "rb") as img_file:
+                    img_bytes = img_file.read()
+                    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+                    images_data.append(img_b64)
+            except Exception as e:
+                logger.error(f"Failed to encode image {img_path}: {e}")
+                raise
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "images": images_data
+        }
+        
+        try:
+            response = requests.post(self.image_embed_url, headers=headers, json=data, timeout=30)
+            response.raise_for_status()
+            
+            result = response.json()
+            # Return image embeddings based on on-premises API format
+            return result.get("embeddings", [])
+        except requests.exceptions.RequestException as e:
+            logger.error(f"On-premises image embedding API failed: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 logger.error(f"Response content: {e.response.text}")
             raise
     
     def _embed_with_clip(self, texts: List[str] = None, image_paths: List[str] = None) -> List[List[float]]:
         """Embed using local CLIP model."""
+        if not hasattr(self, 'clip_model'):
+            raise RuntimeError("Local CLIP model not initialized")
+            
         embeddings = []
         
-        if texts:
-            inputs = self.clip_processor(text=texts, return_tensors="pt", padding=True, truncation=True)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                text_embeddings = self.clip_model.get_text_features(**inputs)
-                text_embeddings = text_embeddings / text_embeddings.norm(dim=-1, keepdim=True)
+        try:
+            if texts:
+                # Encode texts
+                text_embeddings = self.clip_model.encode(
+                    texts,
+                    convert_to_tensor=True,
+                    device=self.device
+                )
                 embeddings.extend(text_embeddings.cpu().numpy().tolist())
-        
-        if image_paths:
-            for image_path in image_paths:
-                try:
-                    image = Image.open(image_path).convert("RGB")
-                    inputs = self.clip_processor(images=image, return_tensors="pt")
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                    
-                    with torch.no_grad():
-                        image_embedding = self.clip_model.get_image_features(**inputs)
-                        image_embedding = image_embedding / image_embedding.norm(dim=-1, keepdim=True)
-                        embeddings.append(image_embedding.cpu().numpy().tolist()[0])
-                        
-                except Exception as e:
-                    logger.error(f"Error processing image {image_path}: {e}")
-                    # Return zero embedding as fallback
-                    embeddings.append([0.0] * 512)  # CLIP base has 512 dimensions
-        
-        return embeddings
+            
+            if image_paths:
+                # Load and encode images
+                from PIL import Image
+                for img_path in image_paths:
+                    try:
+                        image = Image.open(img_path).convert('RGB')
+                        img_embedding = self.clip_model.encode(
+                            image,
+                            convert_to_tensor=True,
+                            device=self.device
+                        )
+                        embeddings.append(img_embedding.cpu().numpy().tolist())
+                    except Exception as e:
+                        logger.error(f"Failed to process image {img_path}: {e}")
+                        # Add zero embedding as placeholder
+                        embeddings.append([0.0] * 512)  # Default CLIP embedding size
+            
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Local CLIP embedding failed: {e}")
+            raise
     
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """Embed text documents."""
+        """Embed text using configured method."""
+        if not texts:
+            return []
+            
         if self.use_api:
-            if self.use_custom_api:
-                return self._embed_text_with_custom_api(texts)
-            else:
-                inputs = [{"type": "text", "text": text} for text in texts]
-                return self._embed_with_official_api(inputs)
+            return self._embed_text_with_api(texts)
         else:
             return self._embed_with_clip(texts=texts)
     
     def embed_images(self, image_paths: List[str]) -> List[List[float]]:
-        """Embed images."""
+        """Embed images using configured method."""
+        if not image_paths:
+            return []
+            
         if self.use_api:
-            if self.use_custom_api:
-                return self._embed_images_with_custom_api(image_paths)
-            else:
-                inputs = []
-                for image_path in image_paths:
-                    try:
-                        image_b64 = self._image_to_base64(image_path)
-                        inputs.append({"type": "image", "image": image_b64})
-                    except Exception as e:
-                        logger.error(f"Error encoding image {image_path}: {e}")
-                        continue
-                
-                if inputs:
-                    return self._embed_with_official_api(inputs)
-                else:
-                    return []
+            return self._embed_images_with_api(image_paths)
         else:
             return self._embed_with_clip(image_paths=image_paths)
     
@@ -288,74 +219,100 @@ class JinaMultimodalEmbeddings(MultimodalEmbeddingBase):
 
 class MultimodalEmbeddingManager:
     """
-    Manages both text and multimodal embeddings with flexible configuration.
-    Supports local models and various API endpoints.
+    Manager for different embedding models (text-only and multimodal).
+    Handles only on-premises APIs and local models.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  text_embedding_model: str = "jinaai/jina-embeddings-v3",
                  multimodal_embedding_model: str = "jinaai/jina-embeddings-v4",
-                 jina_api_key: Optional[str] = None,
                  jina_api_base_url: Optional[str] = None,
                  force_local_embeddings: bool = False):
         """
-        Initialize the multimodal embedding manager.
+        Initialize embedding manager with on-premises configuration only.
         
         Args:
             text_embedding_model: Model for text embeddings
-            multimodal_embedding_model: Model for multimodal embeddings
-            jina_api_key: Jina API key for multimodal embeddings
-            jina_api_base_url: Custom API base URL (e.g., "http://10.144.100.204:38044")
-            force_local_embeddings: Force using local models for all embeddings
+            multimodal_embedding_model: Model for multimodal embeddings  
+            jina_api_base_url: On-premises API base URL
+            force_local_embeddings: Force using local models instead of API
         """
         self.text_embedding_model = text_embedding_model
         self.multimodal_embedding_model = multimodal_embedding_model
+        self.jina_api_base_url = jina_api_base_url
         self.force_local_embeddings = force_local_embeddings
         
+        logger.info(f"Initializing embedding manager...")
+        logger.info(f"Text model: {text_embedding_model}")
+        logger.info(f"Multimodal model: {multimodal_embedding_model}")
+        logger.info(f"On-premises API: {jina_api_base_url if jina_api_base_url else 'None (using local)'}")
+        
         # Initialize text embeddings
-        # For text embeddings, prefer custom API if available and model is jina-embeddings-v4
-        if (not force_local_embeddings and 
-            jina_api_base_url and 
-            "jina-embeddings-v4" in text_embedding_model):
-            
-            logger.info(f"Using custom API for text embeddings: {text_embedding_model}")
-            jina_text_embeddings = JinaMultimodalEmbeddings(
-                model_name=text_embedding_model,
-                api_key=jina_api_key,
-                api_base_url=jina_api_base_url,
-                force_api=True
-            )
-
-            # Wrap up chroma compitable
-            self.text_embeddings = CustomMultimodalEmbeddings(jina_text_embeddings)
-            
-        else:
-            # Use HuggingFace for text embeddings
-            logger.info(f"Using HuggingFace for text embeddings: {text_embedding_model}")
-            self.text_embeddings = HuggingFaceEmbeddings(
-                model_name=text_embedding_model,
-                encode_kwargs={'normalize_embeddings': True},
-                model_kwargs={'trust_remote_code': True}
-            )
+        self._init_text_embeddings()
         
         # Initialize multimodal embeddings
-        self.multimodal_embeddings = JinaMultimodalEmbeddings(
-            model_name=multimodal_embedding_model,
-            api_key=jina_api_key,
-            api_base_url=jina_api_base_url,
-            force_local=force_local_embeddings
-        )
+        self._init_multimodal_embeddings()
         
-        logger.info(f"Embedding manager initialized with text model: {text_embedding_model}, multimodal model: {multimodal_embedding_model}")
-        if jina_api_base_url:
-            logger.info(f"Custom API endpoint: {jina_api_base_url}")
+        logger.info("Embedding manager initialized successfully")
     
-    def get_text_embedding_function(self):
-        """Get the text embedding function."""
+    def _init_text_embeddings(self):
+        """Initialize text embedding model."""
+        try:
+            if "jina" in self.text_embedding_model.lower() and self.jina_api_base_url and not self.force_local_embeddings:
+                logger.info("Using on-premises API for text embeddings")
+                
+                # Create custom embeddings wrapper for ChromaDB compatibility
+                jina_text_embeddings = JinaMultimodalEmbeddings(
+                    model_name=self.text_embedding_model,
+                    api_base_url=self.jina_api_base_url,
+                    force_local=False
+                )
+                
+                # Wrap for ChromaDB compatibility
+                self.text_embeddings = CustomMultimodalEmbeddings(jina_text_embeddings)
+                logger.info("Custom multimodal embeddings wrapper created for text")
+            else:
+                # Use HuggingFace embeddings for text
+                logger.info(f"Using HuggingFace embeddings for text: {self.text_embedding_model}")
+                self.text_embeddings = HuggingFaceEmbeddings(
+                    model_name=self.text_embedding_model,
+                    model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize text embeddings: {e}")
+            logger.info("Falling back to basic text embeddings")
+            # Fallback to a simple model
+            try:
+                self.text_embeddings = HuggingFaceEmbeddings(
+                    model_name="all-MiniLM-L6-v2",
+                    model_kwargs={'device': 'cpu'}
+                )
+            except Exception as fallback_error:
+                logger.error(f"Fallback text embeddings also failed: {fallback_error}")
+                raise
+    
+    def _init_multimodal_embeddings(self):
+        """Initialize multimodal embedding model."""
+        try:
+            # Always use Jina for multimodal embeddings (on-premises or local)
+            self.multimodal_embeddings = JinaMultimodalEmbeddings(
+                model_name=self.multimodal_embedding_model,
+                api_base_url=self.jina_api_base_url,
+                force_local=self.force_local_embeddings
+            )
+            logger.info("Multimodal embeddings initialized")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize multimodal embeddings: {e}")
+            raise
+    
+    def get_text_embeddings(self):
+        """Get text embedding model."""
         return self.text_embeddings
     
-    def get_multimodal_embedding_function(self):
-        """Get the multimodal embedding function."""
+    def get_multimodal_embeddings(self):
+        """Get multimodal embedding model."""
         return self.multimodal_embeddings
     
     def embed_documents_by_type(self, documents: List[Document]) -> Dict[str, List[Document]]:
