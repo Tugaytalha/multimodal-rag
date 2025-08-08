@@ -34,36 +34,9 @@ from langchain.schema.document import Document
 
 # Custom modules
 from config import get_default_config
-try:
-    from multimodal_document_processor import MultimodalDocumentProcessor, ExtractedElement
-except ImportError as e:
-    try:
-        print(e)
-        from ultimodal_document_processor import MultimodalDocumentProcessor, ExtractedElement
-    except ImportError:
-        print("⚠️ Warning: Could not import document processor. Some features may not work.")
-        MultimodalDocumentProcessor = None
-        ExtractedElement = None
-
-try:
-    from multimodal_vector_db import MultimodalVectorDatabase, MultimodalRAGRetriever
-except ImportError as r:
-    try:
-        print(r)
-        from ultimodal_vector_db import MultimodalVectorDatabase, MultimodalRAGRetriever
-    except ImportError:
-        print("⚠️ Warning: Could not import vector database. Some features may not work.")
-        MultimodalVectorDatabase = None
-        MultimodalRAGRetriever = None
-
-try:
-    from multimodal_embeddings import MultimodalEmbeddingManager
-except ImportError:
-    try:
-        from ultimodal_embeddings import MultimodalEmbeddingManager
-    except ImportError:
-        print("⚠️ Warning: Could not import embedding manager. Some features may not work.")
-        MultimodalEmbeddingManager = None
+from multimodal_document_processor import MultimodalDocumentProcessor, ExtractedElement
+from multimodal_vector_db import MultimodalVectorDatabase, MultimodalRAGRetriever
+from multimodal_embeddings import MultimodalEmbeddingManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -106,14 +79,6 @@ class MultimodalRAGSystem:
         
         logger.info(f"Initializing with LLM: {self.llm_model_name}, VLM: {self.vlm_model_name}")
         
-        # Check if required components are available
-        if MultimodalDocumentProcessor is None:
-            raise ImportError("MultimodalDocumentProcessor is not available. Please install missing dependencies.")
-        if MultimodalVectorDatabase is None:
-            raise ImportError("MultimodalVectorDatabase is not available. Please install missing dependencies.")
-        if MultimodalEmbeddingManager is None:
-            raise ImportError("MultimodalEmbeddingManager is not available. Please install missing dependencies.")
-        
         # Initialize components with config
         self.document_processor = MultimodalDocumentProcessor(
             vlm_model_name=self.vlm_model_name,
@@ -124,7 +89,6 @@ class MultimodalRAGSystem:
             chroma_path=self.chroma_path,
             text_embedding_model=config["text_embedding_model"],
             multimodal_embedding_model=config["multimodal_embedding_model"],
-            jina_api_key=config["jina_api_key"],
             jina_api_base_url=config["jina_api_base_url"],
             force_local_embeddings=config["force_local_embeddings"]
         )

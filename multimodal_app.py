@@ -99,31 +99,19 @@ def initialize_rag_system(text_embedding_model: str,
                          multimodal_embedding_model: str,
                          vlm_model: str,
                          llm_model: str,
-                         jina_api_key: str = None,
                          force_local: bool = False):
-    """Initialize the RAG system with given parameters."""
-    global rag_system
-    
-    # Get default config and update with Gradio settings
+    """Initialize the multimodal RAG system with on-premises configuration only."""
     config = get_default_config()
     config.update({
         "text_embedding_model": text_embedding_model,
         "multimodal_embedding_model": multimodal_embedding_model,
         "vlm_model": vlm_model,
         "llm_model": llm_model,
-        "jina_api_key": jina_api_key,
         "force_local_embeddings": force_local
     })
     
-    logger.info("🔧 Initializing multimodal RAG system...")
-    
-    try:
-        rag_system = create_multimodal_rag_system(config)
-        logger.info("✅ System initialized successfully!")
-        return "System initialized successfully!", rag_system.get_database_stats()
-    except Exception as e:
-        logger.error(f"❌ System initialization failed: {e}")
-        return f"System initialization failed: {e}", {}
+    rag_system = create_multimodal_rag_system(config)
+    return rag_system, "✅ RAG system initialized successfully!"
 
 def process_query(
     question: str,
@@ -236,20 +224,16 @@ def populate_database(
     text_embedding_model: str,
     multimodal_embedding_model: str,
     vlm_model: str,
-    llm_model: str,
-    jina_api_key: str = None
+    llm_model: str
 ):
-    """Populate the database with documents from data directory."""
-    global rag_system
-    
+    """Populate database with documents from data directory."""
     try:
-        # Initialize or reinitialize the system
-        rag_system = initialize_rag_system(
+        rag_system, init_message = initialize_rag_system(
             text_embedding_model=text_embedding_model,
             multimodal_embedding_model=multimodal_embedding_model,
             vlm_model=vlm_model,
             llm_model=llm_model,
-            jina_api_key=jina_api_key
+            force_local=False
         )
         
         if reset_db:
@@ -364,26 +348,44 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                     gr.Markdown("### ⚙️ Model Settings")
                     with gr.Row():
                         with gr.Column():
-                            llm_model = gr.Dropdown(
-                                choices=LLM_MODELS,
-                                value=DEFAULT_LLM_MODEL_UI,
-                                label="💬 LLM Model",
-                                info="Language model for response generation"
-                            )
+                            # Configuration for query processing
+                            with gr.Row():
+                                llm_model = gr.Dropdown(
+                                    choices=LLM_MODELS,
+                                    value=DEFAULT_LLM_MODEL_UI,
+                                    label="💬 LLM Model",
+                                    info="Language model for response generation"
+                                )
+                                
+                                force_local_checkbox = gr.Checkbox(
+                                    label="🔧 Force Local Models",
+                                    value=False,
+                                    info="Use local models instead of API endpoints"
+                                )
                             
-                            text_embedding_model = gr.Dropdown(
-                                choices=EMBEDDING_MODELS,
-                                value="jinaai/jina-embeddings-v3",
-                                label="📝 Text Embedding Model",
-                                info="Model for embedding text content"
+                            # Initialize system button
+                            init_btn = gr.Button("🚀 Initialize RAG System", variant="primary", size="lg")
+                            init_status = gr.Textbox(label="System Status", interactive=False)
+                            
+                            # System initialization
+                            init_btn.click(
+                                fn=initialize_rag_system,
+                                inputs=[
+                                    text_embedding_model, 
+                                    multimodal_embedding_model, 
+                                    vlm_model, 
+                                    llm_model,
+                                    force_local_checkbox
+                                ],
+                                outputs=[gr.State(), init_status]
                             )
                         
                         with gr.Column():
                             multimodal_embedding_model = gr.Dropdown(
                                 choices=MULTIMODAL_EMBEDDING_MODELS,
-                                value="jinaai/jina-embeddings-v4",
+                                value=MULTIMODAL_EMBEDDING_MODELS[0],
                                 label="🖼️ Multimodal Embedding Model",
-                                info="Model for embedding page images"
+                                info="Model for image and page embeddings"
                             )
                             
                             vlm_model = gr.Dropdown(
@@ -391,6 +393,19 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                                 value=DEFAULT_VLM_MODEL_UI,
                                 label="👁️ Vision Language Model",
                                 info="Model for describing images and graphs"
+                            )
+                            
+                            llm_model = gr.Dropdown(
+                                choices=LLM_MODELS,
+                                value=DEFAULT_LLM_MODEL_UI,
+                                label="💬 LLM Model",
+                                info="Language model for response generation"
+                            )
+                            
+                            force_local_checkbox = gr.Checkbox(
+                                label="🔧 Force Local Models",
+                                value=False,
+                                info="Use local models instead of API endpoints"
                             )
             
             with gr.Column(scale=1):
@@ -444,14 +459,6 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                 label="Retrieved Documents",
                 wrap=True,
                 column_widths=[10, 20, 50, 10]
-            )
-        
-        # API Key input (optional)
-        with gr.Row():
-            jina_api_key_input = gr.Textbox(
-                label="Jina API Key (Optional)",
-                placeholder="Enter Jina API key for enhanced multimodal embeddings",
-                type="password"
             )
         
         query_button.click(
@@ -524,12 +531,6 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                         label="LLM Model"
                     )
                     
-                    db_jina_api_key_input = gr.Textbox(
-                        label="Jina API Key (Optional)",
-                        placeholder="For enhanced multimodal embeddings",
-                        type="password"
-                    )
-                    
                     populate_button = gr.Button("Populate Database", variant="primary")
                     status_output = gr.Textbox(label="Processing Status", interactive=False, lines=8)
         
@@ -546,8 +547,7 @@ with gr.Blocks(title="Multimodal RAG System", theme=gr.themes.Soft()) as demo:
                 db_text_embedding_dropdown,
                 db_multimodal_embedding_dropdown,
                 db_vlm_dropdown,
-                db_llm_dropdown,
-                db_jina_api_key_input
+                db_llm_dropdown
             ],
             outputs=status_output
         )

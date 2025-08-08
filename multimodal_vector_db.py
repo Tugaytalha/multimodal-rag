@@ -10,23 +10,11 @@ from langchain_chroma import Chroma
 from langchain.schema.document import Document
 
 # Custom modules
-try:
-    from multimodal_embeddings import (
-        MultimodalEmbeddingManager, 
-        CustomMultimodalEmbeddings, 
-        PageImageEmbeddings
-    )
-except ImportError:
-    try:
-        from ultimodal_embeddings import (
-            MultimodalEmbeddingManager, 
-            CustomMultimodalEmbeddings, 
-            PageImageEmbeddings
-        )
-    except ImportError:
-        print("⚠️  Error: Could not import embedding modules.")
-        print("   Please ensure the embedding files are available.")
-        raise
+from multimodal_embeddings import (
+    MultimodalEmbeddingManager, 
+    CustomMultimodalEmbeddings, 
+    PageImageEmbeddings
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,33 +25,32 @@ class MultimodalVectorDatabase:
     Vector database manager for handling multiple collections with different embedding strategies.
     """
     
-    def __init__(self,
+    def __init__(self, 
                  chroma_path: str = "multimodal_chroma",
                  text_embedding_model: str = "jinaai/jina-embeddings-v3",
                  multimodal_embedding_model: str = "jinaai/jina-embeddings-v4",
-                 jina_api_key: Optional[str] = None,
                  jina_api_base_url: Optional[str] = None,
                  force_local_embeddings: bool = False):
         """
-        Initialize the multimodal vector database.
+        Initialize multimodal vector database with on-premises configuration only.
         
         Args:
-            chroma_path: Path to ChromaDB persistence directory
+            chroma_path: Path to ChromaDB storage
             text_embedding_model: Model for text embeddings
             multimodal_embedding_model: Model for multimodal embeddings
-            jina_api_key: Jina API key for multimodal embeddings
-            jina_api_base_url: Custom API base URL (e.g., "http://10.144.100.204:38044")
-            force_local_embeddings: Force using local models for all embeddings
+            jina_api_base_url: On-premises API base URL for embeddings
+            force_local_embeddings: Force using local models instead of API
         """
         self.chroma_path = chroma_path
-        self.text_collection_path = os.path.join(chroma_path, "text_content")
-        self.page_collection_path = os.path.join(chroma_path, "page_images")
+        self.text_embedding_model = text_embedding_model
+        self.multimodal_embedding_model = multimodal_embedding_model
+        self.jina_api_base_url = jina_api_base_url
+        self.force_local_embeddings = force_local_embeddings
         
-        # Initialize embedding manager with API configuration
+        # Initialize embedding manager with on-premises configuration
         self.embedding_manager = MultimodalEmbeddingManager(
             text_embedding_model=text_embedding_model,
             multimodal_embedding_model=multimodal_embedding_model,
-            jina_api_key=jina_api_key,
             jina_api_base_url=jina_api_base_url,
             force_local_embeddings=force_local_embeddings
         )

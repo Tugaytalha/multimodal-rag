@@ -11,10 +11,7 @@ import logging
 from pathlib import Path
 
 # Import our multimodal RAG system
-try:
-    from multimodal_rag_system import create_multimodal_rag_system
-except ImportError:
-    from ultimodal_rag_system import create_multimodal_rag_system
+from multimodal_rag_system import create_multimodal_rag_system
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,15 +23,16 @@ def main():
     print("🔬 Multimodal RAG System - Example Usage")
     print("=" * 50)
     
-    # Configuration for the RAG system
+    # Configuration with on-premises settings only
     config = {
-        "chroma_path": "example_chroma",
-        "extracted_content_path": "example_extracted_content",
+        "chroma_path": "demo_chroma",
+        "extracted_content_path": "demo_extracted",
         "text_embedding_model": "jinaai/jina-embeddings-v3",
         "multimodal_embedding_model": "jinaai/jina-embeddings-v4",
-        "vlm_model": "microsoft/git-base-coco",
-        "llm_model": "llama3.2:3b",
-        "jina_api_key": os.getenv("JINA_API_KEY")  # Optional
+        "vlm_model": "gemma3:27b",
+        "llm_model": "gemma3:27b",
+        "jina_api_base_url": "http://10.144.100.204:38044",  # On-premises API
+        "force_local_embeddings": False
     }
     
     print(f"📋 Configuration:")
