@@ -33,10 +33,12 @@ except ImportError:
 from langchain.schema.document import Document
 
 # Custom modules
+from config import get_default_config
 try:
     from multimodal_document_processor import MultimodalDocumentProcessor, ExtractedElement
-except ImportError:
+except ImportError as e:
     try:
+        print(e)
         from ultimodal_document_processor import MultimodalDocumentProcessor, ExtractedElement
     except ImportError:
         print("⚠️ Warning: Could not import document processor. Some features may not work.")
@@ -45,8 +47,9 @@ except ImportError:
 
 try:
     from multimodal_vector_db import MultimodalVectorDatabase, MultimodalRAGRetriever
-except ImportError:
+except ImportError as r:
     try:
+        print(r)
         from ultimodal_vector_db import MultimodalVectorDatabase, MultimodalRAGRetriever
     except ImportError:
         print("⚠️ Warning: Could not import vector database. Some features may not work.")
@@ -72,29 +75,36 @@ class MultimodalRAGSystem:
     storage, retrieval, and response generation.
     """
     
-    def __init__(self,
-                 chroma_path: str = "multimodal_chroma",
-                 extracted_content_path: str = "extracted_content",
-                 text_embedding_model: str = "jinaai/jina-embeddings-v4",
-                 multimodal_embedding_model: str = "jinaai/jina-embeddings-v4",
-                 vlm_model: str = "gemma3:4b",
-                 llm_model: str = "gemma3:4b",
-                 jina_api_key: Optional[str] = None):
+    def __init__(self, **kwargs):
         """
-        Initialize the multimodal RAG system.
+        Initialize the multimodal RAG system using a configuration dictionary.
         
         Args:
-            chroma_path: Path for ChromaDB storage
-            extracted_content_path: Path for storing extracted images and pages
-            text_embedding_model: Model for text embeddings
-            multimodal_embedding_model: Model for multimodal embeddings
-            vlm_model: Vision language model for image descriptions
-            llm_model: Language model for response generation
-            jina_api_key: API key for Jina embeddings
+            **kwargs: Configuration parameters from config.py
         """
-        self.chroma_path = chroma_path
-        self.extracted_content_path = extracted_content_path
-        self.llm_model = llm_model
+        # Load configuration and validate to prevent None values
+        config = get_default_config()
+        config.update(kwargs)
+        
+        # Additional validation to ensure critical models are not None
+        from config import validate_and_fix_config, DEFAULT_LLM_MODEL, DEFAULT_VLM_MODEL
+        config = validate_and_fix_config(config)
+        
+        self.chroma_path = config["chroma_path"]
+        self.extracted_content_path = config["extracted_content_path"]
+        self.llm_model_name = config["llm_model"]
+        self.vlm_model_name = config["vlm_model"]
+        
+        # Final safety check to prevent None values
+        if not self.llm_model_name or self.llm_model_name is None:
+            self.llm_model_name = DEFAULT_LLM_MODEL
+            logger.warning(f"LLM model was None, using default: {DEFAULT_LLM_MODEL}")
+            
+        if not self.vlm_model_name or self.vlm_model_name is None:
+            self.vlm_model_name = DEFAULT_VLM_MODEL
+            logger.warning(f"VLM model was None, using default: {DEFAULT_VLM_MODEL}")
+        
+        logger.info(f"Initializing with LLM: {self.llm_model_name}, VLM: {self.vlm_model_name}")
         
         # Check if required components are available
         if MultimodalDocumentProcessor is None:
@@ -104,22 +114,25 @@ class MultimodalRAGSystem:
         if MultimodalEmbeddingManager is None:
             raise ImportError("MultimodalEmbeddingManager is not available. Please install missing dependencies.")
         
-        # Initialize components
+        # Initialize components with config
         self.document_processor = MultimodalDocumentProcessor(
-            vlm_model_name=vlm_model
+            vlm_model_name=self.vlm_model_name,
+            llm_model_name=self.llm_model_name
         )
         
         self.vector_db = MultimodalVectorDatabase(
-            chroma_path=chroma_path,
-            text_embedding_model=text_embedding_model,
-            multimodal_embedding_model=multimodal_embedding_model,
-            jina_api_key=jina_api_key
+            chroma_path=self.chroma_path,
+            text_embedding_model=config["text_embedding_model"],
+            multimodal_embedding_model=config["multimodal_embedding_model"],
+            jina_api_key=config["jina_api_key"],
+            jina_api_base_url=config["jina_api_base_url"],
+            force_local_embeddings=config["force_local_embeddings"]
         )
         
         self.retriever = MultimodalRAGRetriever(self.vector_db)
         
-        # Initialize LLM
-        self.llm = Ollama(model=llm_model)
+        # Initialize LLM with validated model name
+        self.llm = Ollama(model=self.llm_model_name)
         
         # Prompt template for multimodal responses
         self.prompt_template = ChatPromptTemplate.from_template("""
@@ -130,15 +143,18 @@ Context from retrieved documents:
 
 Instructions:
 - Answer the question based on the provided context
-- When referencing images or graphs, describe what you see and how it relates to the question
-- When referencing tables, summarize the key information that answers the question
-- If the context contains page images, mention that visual information is available
-- Be specific about which type of content (text, image, table, graph) you're referencing
-- If you cannot answer based on the provided context, say so clearly
+- If you cannot answer the question using the provided context, say it.
+- Always respond in the language that user used in the question.
 
 Question: {question}
 
 Answer:""")
+
+        #- Be specific about which type of content (text, image, table, graph) you're referencing
+        #- If the context contains page images, mention that visual information is available
+        #- When referencing images or graphs, describe what you see and how it relates to the question
+        #- When referencing tables, summarize the key information that answers the question
+        #- Don't write the references like (Image 5 etc.)
         
         logger.info("Multimodal RAG system initialized successfully")
     
@@ -412,32 +428,22 @@ Answer:""")
         
         return exported_files
 
-def create_multimodal_rag_system(config: Dict[str, Any] = None) -> MultimodalRAGSystem:
+def create_multimodal_rag_system(config: Dict[str, Any] = None) -> "MultimodalRAGSystem":
     """
     Factory function to create a multimodal RAG system with configuration.
     
     Args:
-        config: Configuration dictionary
+        config: Configuration dictionary (overrides defaults)
         
     Returns:
         Configured MultimodalRAGSystem instance
     """
-    if config is None:
-        config = {}
+    # Start with default config from centralized file
+    final_config = get_default_config()
     
-    # Default configuration
-    default_config = {
-        "chroma_path": "multimodal_chroma",
-        "extracted_content_path": "extracted_content",
-        "text_embedding_model": "jinaai/jina-embeddings-v4",
-        "multimodal_embedding_model": "jinaai/jina-embeddings-v4",
-        "vlm_model": "gemma3:4b",
-        "llm_model": "gemma3:4b",
-        "jina_api_key": None
-    }
-    
-    # Merge configurations
-    final_config = {**default_config, **config}
+    # Merge with any provided config
+    if config:
+        final_config.update(config)
     
     return MultimodalRAGSystem(**final_config)
 
