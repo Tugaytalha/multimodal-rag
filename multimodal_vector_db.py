@@ -41,7 +41,9 @@ class MultimodalVectorDatabase:
                  chroma_path: str = "multimodal_chroma",
                  text_embedding_model: str = "jinaai/jina-embeddings-v3",
                  multimodal_embedding_model: str = "jinaai/jina-embeddings-v4",
-                 jina_api_key: Optional[str] = None):
+                 jina_api_key: Optional[str] = None,
+                 jina_api_base_url: Optional[str] = None,
+                 force_local_embeddings: bool = False):
         """
         Initialize the multimodal vector database.
         
@@ -50,16 +52,20 @@ class MultimodalVectorDatabase:
             text_embedding_model: Model for text embeddings
             multimodal_embedding_model: Model for multimodal embeddings
             jina_api_key: Jina API key for multimodal embeddings
+            jina_api_base_url: Custom API base URL (e.g., "http://10.144.100.204:38044")
+            force_local_embeddings: Force using local models for all embeddings
         """
         self.chroma_path = chroma_path
         self.text_collection_path = os.path.join(chroma_path, "text_content")
         self.page_collection_path = os.path.join(chroma_path, "page_images")
         
-        # Initialize embedding manager
+        # Initialize embedding manager with API configuration
         self.embedding_manager = MultimodalEmbeddingManager(
             text_embedding_model=text_embedding_model,
             multimodal_embedding_model=multimodal_embedding_model,
-            jina_api_key=jina_api_key
+            jina_api_key=jina_api_key,
+            jina_api_base_url=jina_api_base_url,
+            force_local_embeddings=force_local_embeddings
         )
         
         # Initialize collections
@@ -67,6 +73,8 @@ class MultimodalVectorDatabase:
         self.page_collection = None
         
         logger.info(f"Vector database initialized with path: {chroma_path}")
+        if jina_api_base_url:
+            logger.info(f"Using custom API endpoint: {jina_api_base_url}")
     
     def _init_collections(self):
         """Initialize ChromaDB collections."""
