@@ -1,52 +1,99 @@
-import os
-import io
-import json
-import base64
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
-from dataclasses import dataclass
-import hashlib
 import logging
+import os
+import fitz  # PyMuPDF
+import base64
+import json
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Union
+from dataclasses import dataclass
+from PIL import Image
+import html2text
 import chardet
+import io
+import hashlib
+
+# Import langchain components
+from langchain.schema.document import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownTextSplitter
+
+# PyMuPDF4LLM for markdown extraction
+try:
+    import pymupdf4llm
+    PYMUPDF4LLM_AVAILABLE = True
+except ImportError:
+    PYMUPDF4LLM_AVAILABLE = False
+    print("⚠️ Warning: pymupdf4llm not available. Install with: pip install pymupdf4llm")
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Document processing
-import fitz  # PyMuPDF for PDF processing
-from docx import Document as DocxDocument
-from docx.document import Document as DocxDocumentType
-from PIL import Image
-import pandas as pd
+# Import optional dependencies with fallbacks
+try:
+    from docx import Document as DocxDocument
+    DOCX_AVAILABLE = True
+except ImportError:
+    logger.warning("python-docx not available. DOCX processing will be limited.")
+    DocxDocument = None
+    DOCX_AVAILABLE = False
 
-# New format support
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    logger.warning("pandas not available. Spreadsheet processing will be limited.")
+    pd = None
+    PANDAS_AVAILABLE = False
+
 try:
     from striprtf.striprtf import rtf_to_text
+    RTF_AVAILABLE = True
 except ImportError:
+    logger.warning("striprtf not available. RTF processing will be limited.")
     rtf_to_text = None
-    logger.warning("striprtf not installed. RTF support will be limited.")
+    RTF_AVAILABLE = False
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    logger.warning("BeautifulSoup not available. HTML processing will be limited.")
+    BeautifulSoup = None
+    BS4_AVAILABLE = False
 
 try:
     import markdown
     from markdown.extensions import codehilite, tables
+    MARKDOWN_AVAILABLE = True
 except ImportError:
     markdown = None
+    MARKDOWN_AVAILABLE = False
     logger.warning("markdown not installed. Markdown support will be limited.")
 
-# Langchain components
-from langchain.schema.document import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownTextSplitter
-from langchain_chroma import Chroma
+# Ollama imports with fallbacks
+try:
+    from langchain_ollama import OllamaLLM as Ollama
+except ImportError:
+    try:
+        from langchain_community.llms import Ollama
+    except ImportError:
+        try:
+            from langchain.llms import Ollama
+        except ImportError:
+            logger.warning("Ollama not available. Please install langchain-ollama or langchain-community")
+            Ollama = None
 
-# HTML processing for tables
-from bs4 import BeautifulSoup
-import html2text
-
-# Vision and LLM processing
-from transformers import AutoProcessor, AutoModelForCausalLM, pipeline
-import torch
-
+# Pipeline import for HuggingFace models
+try:
+    from transformers import pipeline
+    import torch
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    logger.warning("transformers not available. Some VLM models will not work.")
+    pipeline = None
+    torch = None
+    TRANSFORMERS_AVAILABLE = False
 
 @dataclass
 class ExtractedElement:
@@ -401,6 +448,7 @@ What do you see in this image?"""
     def process_pdf(self, pdf_path: str, output_dir: str = "extracted_content") -> List[ExtractedElement]:
         """
         Process PDF file and extract different types of content.
+        Now uses markdown extraction strategy for better text processing.
         
         Args:
             pdf_path: Path to PDF file
@@ -417,10 +465,17 @@ What do you see in this image?"""
         try:
             doc = fitz.open(pdf_path)
             
+            # STEP 1: Extract text using markdown strategy
+            # This provides better structure-aware chunking
+            logger.info("🔤 Extracting text using markdown strategy...")
+            text_elements = self._extract_text_with_markdown_strategy(pdf_path)
+            elements.extend(text_elements)
+            
+            # STEP 2: Process each page for images, tables, and page-level content
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 
-                # Save entire page as image
+                # Save entire page as image for multimodal retrieval
                 page_image_filename = f"page_{page_num + 1}.png"
                 page_image_path = self._save_page_as_image(page, page_image_dir, page_image_filename)
                 
@@ -440,23 +495,10 @@ What do you see in this image?"""
                 )
                 elements.append(page_element)
                 
-                # Extract text
-                text = page.get_text()
-                if text.strip():
-                    text_element = ExtractedElement(
-                        element_type="text",
-                        content=text,
-                        metadata={
-                            "source": pdf_path,
-                            "page": page_num + 1,
-                            "document_name": doc_name
-                        },
-                        page_number=page_num + 1,
-                        element_id=self._generate_element_id(text, page_num + 1, "text")
-                    )
-                    elements.append(text_element)
+                # Get page text for context (not for chunking, just for surrounding context)
+                page_text = page.get_text()
                 
-                # Extract images
+                # Extract images from this page
                 image_list = page.get_images()
                 for img_index, img in enumerate(image_list):
                     try:
@@ -471,8 +513,8 @@ What do you see in this image?"""
                             img_filename = f"img_{page_num + 1}_{img_index}.png"
                             img_path = self._save_image(image, image_dir, img_filename)
                             
-                            # Generate description
-                            surrounding_text = text if text else ""
+                            # Generate description using surrounding page text as context
+                            surrounding_text = page_text if page_text else ""
                             description = self._describe_image_with_vlm(image, surrounding_text)
                             
                             # Determine if it's a graph or regular image
@@ -490,59 +532,65 @@ What do you see in this image?"""
                                     "image_path": img_path,
                                     "description": description,
                                     "surrounding_text": surrounding_text,
-                                    "content_type": element_type
+                                    "content_type": "image"
                                 },
                                 page_number=page_num + 1,
                                 element_id=self._generate_element_id(img_path, page_num + 1, element_type)
                             )
                             elements.append(img_element)
-                            
+                        
                         pix = None
+                        
                     except Exception as e:
                         logger.error(f"Error processing image {img_index} on page {page_num + 1}: {e}")
+                        continue
                 
-                # Extract tables
+                # Extract tables from this page
                 tables = page.find_tables()
                 for table_index, table in enumerate(tables):
                     try:
-                        # Extract table as pandas DataFrame
-                        df = table.to_pandas()
+                        # Extract table as HTML
+                        table_html = table.to_pandas().to_html(index=False, escape=False)
                         
-                        # Convert to HTML
-                        table_html = df.to_html(index=False, escape=False)
-                        
-                        # Generate description
-                        surrounding_text = text if text else ""
-                        description = self._extract_table_description(table_html, surrounding_text)
+                        # Generate description using page text as context
+                        surrounding_text = page_text if page_text else ""
+                        description = self._describe_table_with_llm(table_html, surrounding_text)
                         
                         table_element = ExtractedElement(
                             element_type="table",
-                            content=table_html,
+                            content=description,
                             metadata={
                                 "source": pdf_path,
                                 "page": page_num + 1,
                                 "document_name": doc_name,
+                                "table_html": table_html,
                                 "description": description,
                                 "surrounding_text": surrounding_text,
-                                "table_shape": df.shape,
                                 "content_type": "table"
                             },
                             page_number=page_num + 1,
-                            element_id=self._generate_element_id(table_html, page_num + 1, "table"),
-                            bbox=table.bbox
+                            element_id=self._generate_element_id(table_html, page_num + 1, "table")
                         )
                         elements.append(table_element)
                         
                     except Exception as e:
                         logger.error(f"Error processing table {table_index} on page {page_num + 1}: {e}")
+                        continue
             
             doc.close()
             
+            logger.info(f"✅ PDF processing completed: {len(elements)} elements extracted")
+            logger.info(f"   📄 Text elements: {len([e for e in elements if e.element_type == 'text'])}")
+            logger.info(f"   🖼️ Images: {len([e for e in elements if e.element_type == 'image'])}")
+            logger.info(f"   📊 Graphs: {len([e for e in elements if e.element_type == 'graph'])}")
+            logger.info(f"   📋 Tables: {len([e for e in elements if e.element_type == 'table'])}")
+            logger.info(f"   📑 Page images: {len([e for e in elements if e.element_type == 'page_image'])}")
+            
+            return elements
+            
         except Exception as e:
-            logger.error(f"Error processing PDF {pdf_path}: {e}")
-            raise
-        
-        return elements
+            logger.error(f"Error processing PDF: {e}")
+            return []
     
     def process_docx(self, docx_path: str, output_dir: str = "extracted_content") -> List[ExtractedElement]:
         """
@@ -559,6 +607,10 @@ What do you see in this image?"""
         doc_name = Path(docx_path).stem
         image_dir = os.path.join(output_dir, "images", doc_name)
         
+        if DocxDocument is None:
+            logger.warning("python-docx not available, skipping DOCX processing.")
+            return []
+
         try:
             doc = DocxDocument(docx_path)
             
@@ -582,7 +634,6 @@ What do you see in this image?"""
                 elements.append(text_element)
             
             # Extract images from DOCX
-            from docx.document import Document as DocxDoc
             import zipfile
             
             # Extract images from the DOCX file structure
@@ -751,6 +802,9 @@ What do you see in this image?"""
             logger.warning(f"Empty or whitespace-only content in {file_path}")
             return []
         
+        # Try to detect page breaks or sections
+        page_breaks = self._detect_page_breaks_in_text(text_content)
+        
         # Use recursive text splitter
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -766,6 +820,8 @@ What do you see in this image?"""
         
         for i, chunk in enumerate(text_chunks):
             if chunk.strip():  # Skip empty chunks
+                # Estimate page number for this chunk
+                estimated_page = self._estimate_page_number(chunk, text_content, page_breaks)
                 element_id = f"{file_name}_txt_chunk_{i}"
                 
                 elements.append(ExtractedElement(
@@ -776,9 +832,10 @@ What do you see in this image?"""
                         "file_type": "txt",
                         "chunk_index": i,
                         "total_chunks": len(text_chunks),
-                        "encoding": encoding
+                        "encoding": encoding,
+                        "page_estimated": True if len(page_breaks) > 0 else False
                     },
-                    page_number=1,  # TXT files don't have pages
+                    page_number=estimated_page,  # Estimated page number
                     element_id=element_id
                 ))
         
@@ -798,7 +855,7 @@ What do you see in this image?"""
         """
         logger.info(f"Processing RTF file: {file_path}")
         
-        if rtf_to_text is None:
+        if not RTF_AVAILABLE:
             logger.error("striprtf library not available. Cannot process RTF files.")
             raise ImportError("striprtf library required for RTF processing. Install with: pip install striprtf")
         
@@ -822,6 +879,9 @@ What do you see in this image?"""
             logger.warning(f"Empty or whitespace-only content after RTF conversion in {file_path}")
             return []
         
+        # Try to detect page breaks or sections
+        page_breaks = self._detect_page_breaks_in_text(text_content)
+        
         # Use recursive text splitter (same as TXT processing)
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -837,6 +897,8 @@ What do you see in this image?"""
         
         for i, chunk in enumerate(text_chunks):
             if chunk.strip():  # Skip empty chunks
+                # Estimate page number for this chunk
+                estimated_page = self._estimate_page_number(chunk, text_content, page_breaks)
                 element_id = f"{file_name}_rtf_chunk_{i}"
                 
                 elements.append(ExtractedElement(
@@ -847,9 +909,10 @@ What do you see in this image?"""
                         "file_type": "rtf",
                         "chunk_index": i,
                         "total_chunks": len(text_chunks),
-                        "original_format": "rtf"
+                        "original_format": "rtf",
+                        "page_estimated": True if len(page_breaks) > 0 else False
                     },
-                    page_number=1,  # RTF files don't have clear page structure
+                    page_number=estimated_page,  # Estimated page number
                     element_id=element_id
                 ))
         
@@ -872,6 +935,10 @@ What do you see in this image?"""
         file_extension = Path(file_path).suffix.lower()
         file_name = Path(file_path).name
         
+        if pd is None:
+            logger.warning("pandas not available, skipping spreadsheet processing.")
+            return []
+
         try:
             # Read spreadsheet based on format
             if file_extension == '.csv':
@@ -970,30 +1037,38 @@ What do you see in this image?"""
             logger.error(f"Error processing spreadsheet {file_path}: {e}")
             return []
     
-    def _describe_table_with_llm(self, df: pd.DataFrame, table_name: str) -> str:
+    def _describe_table_with_llm(self, table_data, table_name: str) -> str:
         """
-        Generate a description of the table using LLM (similar to table processing in PDF).
+        Generate a description of the table using LLM.
         
         Args:
-            df: DataFrame containing table data
+            table_data: DataFrame or HTML string containing table data
             table_name: Name/identifier for the table
             
         Returns:
             Text description of the table
         """
         try:
-            # Create a summary of the table structure and content
-            table_info = f"Table: {table_name}\n"
-            table_info += f"Shape: {df.shape[0]} rows, {df.shape[1]} columns\n"
-            table_info += f"Columns: {', '.join(df.columns.tolist())}\n\n"
-            
-            # Add a sample of the data (first few rows)
-            sample_rows = min(5, len(df))
-            table_info += f"Sample data (first {sample_rows} rows):\n"
-            table_info += df.head(sample_rows).to_string(index=False)
+            # Handle different input types
+            if isinstance(table_data, str):
+                # HTML string - convert to readable text
+                table_text = self.html_converter.handle(table_data) if hasattr(self, 'html_converter') else table_data
+                table_info = f"Table: {table_name}\n{table_text}"
+            elif PANDAS_AVAILABLE and isinstance(table_data, pd.DataFrame):
+                # DataFrame - create summary
+                table_info = f"Table: {table_name}\n"
+                table_info += f"Shape: {table_data.shape[0]} rows, {table_data.shape[1]} columns\n"
+                table_info += f"Columns: {', '.join(table_data.columns.tolist())}\n\n"
+                
+                # Add a sample of the data (first few rows)
+                sample_rows = min(5, len(table_data))
+                table_info += f"Sample data (first {sample_rows} rows):\n"
+                table_info += table_data.head(sample_rows).to_string(index=False)
+            else:
+                table_info = f"Table: {table_name}\nData: {str(table_data)[:500]}"
             
             # Generate description using LLM
-            prompt = f"""Analyze this spreadsheet table and provide a concise description of its content, structure, and key information:
+            prompt = f"""Analyze this table and provide a concise description of its content, structure, and key information:
 
 {table_info}
 
@@ -1003,7 +1078,7 @@ Please provide a brief but informative description that captures:
 
 Description:"""
 
-            if self.llm_model:
+            if hasattr(self, 'llm_model') and self.llm_model:
                 try:
                     response = self.llm_model.invoke(prompt)
                     return response.strip() if hasattr(response, 'strip') else str(response).strip()
@@ -1011,11 +1086,14 @@ Description:"""
                     logger.warning(f"LLM description failed for table {table_name}: {e}")
             
             # Fallback: return basic description
-            return f"Spreadsheet table '{table_name}' with {df.shape[0]} rows and {df.shape[1]} columns. Columns: {', '.join(df.columns.tolist())}. Contains structured data suitable for analysis."
+            if PANDAS_AVAILABLE and isinstance(table_data, pd.DataFrame):
+                return f"Table '{table_name}' with {table_data.shape[0]} rows and {table_data.shape[1]} columns. Columns: {', '.join(table_data.columns.tolist())}. Contains structured data suitable for analysis."
+            else:
+                return f"Table: {table_name}. Contains structured data in tabular format."
             
         except Exception as e:
             logger.error(f"Error generating table description for {table_name}: {e}")
-            return f"Spreadsheet table: {table_name}"
+            return f"Table: {table_name}"
     
     def process_json(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
         """
@@ -1076,7 +1154,7 @@ Description:"""
                             "table_shape": df.shape,
                             "columns": df.columns.tolist() if hasattr(df, 'columns') else []
                         },
-                        page_number=1,
+                        page_number=1,  # JSON files don't have pages
                         element_id=element_id
                     ))
                     
@@ -1156,7 +1234,7 @@ Description:"""
                         "total_chunks": len(text_chunks),
                         "is_structured_data": True
                     },
-                    page_number=1,
+                    page_number=1,  # JSON files are single-page conceptually
                     element_id=element_id
                 ))
         
@@ -1274,7 +1352,7 @@ Description:"""
                                 "surrounding_text": surrounding_text,
                                 "markdown_context": True
                             },
-                            page_number=1,
+                            page_number=1,  # Markdown files are typically single-page
                             element_id=f"{file_name}_img_{len(elements)}"
                         )
                         elements.append(img_element)
@@ -1284,6 +1362,9 @@ Description:"""
         
         # Remove image markdown syntax for text processing
         text_content = re.sub(image_pattern, '', markdown_content)
+        
+        # Try to detect page/section breaks in markdown
+        page_breaks = self._detect_page_breaks_in_text(text_content)
         
         # Use MarkdownTextSplitter with hierarchy awareness
         if markdown is not None:
@@ -1315,6 +1396,8 @@ Description:"""
         
         for i, chunk in enumerate(text_chunks):
             if chunk.strip():  # Skip empty chunks
+                # Estimate page/section number for this chunk
+                estimated_page = self._estimate_page_number(chunk, text_content, page_breaks)
                 element_id = f"{file_name}_md_chunk_{i}"
                 
                 elements.append(ExtractedElement(
@@ -1325,9 +1408,10 @@ Description:"""
                         "file_type": "md",
                         "chunk_index": i,
                         "total_chunks": len(text_chunks),
-                        "is_markdown": True
+                        "is_markdown": True,
+                        "page_estimated": True if len(page_breaks) > 0 else False
                     },
-                    page_number=1,
+                    page_number=estimated_page,  # Estimated page/section number
                     element_id=element_id
                 ))
         
@@ -1346,6 +1430,11 @@ Description:"""
             List of extracted elements (text chunks and images)
         """
         logger.info(f"Processing HTML file: {file_path}")
+        
+        if not BS4_AVAILABLE:
+            logger.warning("BeautifulSoup not available, using basic HTML processing.")
+            # Fallback to basic text extraction
+            return self._process_html_basic(file_path, output_dir)
         
         # Read HTML file
         try:
@@ -1448,6 +1537,9 @@ Description:"""
         
         text_content = h.handle(html_content)
         
+        # Try to detect page breaks or sections
+        page_breaks = self._detect_page_breaks_in_text(text_content)
+        
         # Use recursive text splitter with HTML-aware separators
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -1480,13 +1572,75 @@ Description:"""
                         "file_type": "html",
                         "chunk_index": i,
                         "total_chunks": len(text_chunks),
-                        "is_html": True
+                        "is_html": True,
+                        "page_estimated": True if len(page_breaks) > 0 else False
                     },
-                    page_number=1,
+                    page_number=self._estimate_page_number(chunk, text_content, page_breaks), # Estimated page number
                     element_id=element_id
                 ))
         
         logger.info(f"Extracted {len(elements)} elements from HTML file {file_path}")
+        return elements
+    
+    def _process_html_basic(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
+        """
+        Basic HTML processing without BeautifulSoup (fallback method).
+        """
+        logger.info(f"Processing HTML file with basic method: {file_path}")
+        
+        # Read HTML file
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                html_content = f.read()
+        
+        # Convert HTML to text using html2text
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.body_width = 0
+        
+        text_content = h.handle(html_content)
+        
+        # Try to detect page breaks
+        page_breaks = self._detect_page_breaks_in_text(text_content)
+        
+        # Use recursive text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        
+        text_chunks = text_splitter.split_text(text_content)
+        
+        elements = []
+        file_name = Path(file_path).name
+        
+        for i, chunk in enumerate(text_chunks):
+            if chunk.strip():
+                estimated_page = self._estimate_page_number(chunk, text_content, page_breaks)
+                element_id = f"{file_name}_html_basic_chunk_{i}"
+                
+                elements.append(ExtractedElement(
+                    element_type="text",
+                    content=chunk,
+                    metadata={
+                        "source_file": file_name,
+                        "file_type": "html",
+                        "chunk_index": i,
+                        "total_chunks": len(text_chunks),
+                        "is_html": True,
+                        "basic_processing": True,
+                        "page_estimated": True if len(page_breaks) > 0 else False
+                    },
+                    page_number=estimated_page,
+                    element_id=element_id
+                ))
+        
+        logger.info(f"Extracted {len(elements)} elements from HTML file using basic processing")
         return elements
     
     def process_image_file(self, file_path: str, output_dir: str) -> List[ExtractedElement]:
@@ -1560,6 +1714,269 @@ Description:"""
         except Exception as e:
             logger.error(f"Error processing standalone image file {file_path}: {e}")
             return []
+    
+    def _extract_text_with_markdown_strategy(self, pdf_path: str) -> List[ExtractedElement]:
+        """
+        Extract text from PDF using pymupdf4llm to get markdown format, 
+        then process with MarkdownTextSplitter for better chunking.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            List of text elements with markdown-aware chunking
+        """
+        elements = []
+        
+        if not PYMUPDF4LLM_AVAILABLE:
+            logger.warning("pymupdf4llm not available, falling back to regular text extraction")
+            return self._extract_text_elements(pdf_path)
+        
+        try:
+            logger.info(f"Extracting text as markdown from PDF: {pdf_path}")
+            
+            # Extract markdown text using pymupdf4llm with page chunks to preserve page info
+            try:
+                # Try to get page chunks to preserve page information
+                markdown_data = pymupdf4llm.to_markdown(
+                    pdf_path,
+                    pages=None,  # Process all pages
+                    page_chunks=True,  # Get page-level chunks with metadata
+                    write_images=False,  # We handle images separately
+                    embed_images=False  # Don't embed images in text
+                )
+                
+                # If we get page chunks, process them individually
+                if isinstance(markdown_data, list) and len(markdown_data) > 0:
+                    logger.info(f"Got {len(markdown_data)} page chunks from pymupdf4llm")
+                    
+                    for page_data in markdown_data:
+                        if isinstance(page_data, dict) and 'text' in page_data:
+                            page_text = page_data['text']
+                            page_metadata = page_data.get('metadata', {})
+                            page_number = page_metadata.get('page', 1)  # Get real page number
+                            
+                            if page_text and page_text.strip():
+                                # Use MarkdownTextSplitter for this page's content
+                                markdown_splitter = MarkdownTextSplitter(
+                                    chunk_size=self.chunk_size,
+                                    chunk_overlap=self.chunk_overlap,
+                                    length_function=len,
+                                    is_separator_regex=False,
+                                )
+                                
+                                chunks = markdown_splitter.split_text(page_text)
+                                
+                                for i, chunk_text in enumerate(chunks):
+                                    if chunk_text.strip():
+                                        element = ExtractedElement(
+                                            element_type="text",
+                                            content=chunk_text.strip(),
+                                            metadata={
+                                                "source": pdf_path,
+                                                "page": page_number,  # Real page number
+                                                "chunk_index": i,
+                                                "total_chunks_in_page": len(chunks),
+                                                "extraction_method": "pymupdf4llm_markdown_pages",
+                                                "text_splitter": "MarkdownTextSplitter",
+                                                "page_metadata": page_metadata
+                                            },
+                                            page_number=page_number,  # Real page number
+                                            element_id=self._generate_element_id(chunk_text, page_number, f"text_p{page_number}_c{i}")
+                                        )
+                                        elements.append(element)
+                    
+                    logger.info(f"Created {len(elements)} text elements using page-aware markdown strategy")
+                    return elements
+                    
+            except Exception as e:
+                logger.warning(f"Page chunks extraction failed: {e}, trying regular markdown extraction")
+            
+            # Fallback: Extract as single markdown text (original method)
+            markdown_text = pymupdf4llm.to_markdown(
+                pdf_path,
+                pages=None,  # Process all pages
+                write_images=False,  # We handle images separately
+                embed_images=False  # Don't embed images in text
+            )
+            
+            if not markdown_text or not markdown_text.strip():
+                logger.warning("No markdown text extracted, falling back to regular extraction")
+                return self._extract_text_elements(pdf_path)
+            
+            logger.info(f"Extracted {len(markdown_text)} characters of markdown text")
+            
+            # Try to detect page breaks in the markdown text to assign better page numbers
+            page_breaks = self._detect_page_breaks_in_text(markdown_text)
+            
+            # Use MarkdownTextSplitter for hierarchy-aware chunking
+            markdown_splitter = MarkdownTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                length_function=len,
+                is_separator_regex=False,
+            )
+            
+            # Split the markdown text into chunks
+            chunks = markdown_splitter.split_text(markdown_text)
+            
+            logger.info(f"Split markdown text into {len(chunks)} chunks")
+            
+            # Create ExtractedElement for each chunk with estimated page numbers
+            for i, chunk_text in enumerate(chunks):
+                if chunk_text.strip():  # Only add non-empty chunks
+                    # Estimate page number based on chunk position and page breaks
+                    estimated_page = self._estimate_page_number(chunk_text, markdown_text, page_breaks)
+                    
+                    element = ExtractedElement(
+                        element_type="text",
+                        content=chunk_text.strip(),
+                        metadata={
+                            "source": pdf_path,
+                            "chunk_index": i,
+                            "total_chunks": len(chunks),
+                            "extraction_method": "pymupdf4llm_markdown",
+                            "text_splitter": "MarkdownTextSplitter",
+                            "page_estimated": True
+                        },
+                        page_number=estimated_page,  # Estimated page number
+                        element_id=self._generate_element_id(chunk_text, estimated_page, f"text_est{estimated_page}_c{i}")
+                    )
+                    elements.append(element)
+            
+            logger.info(f"Created {len(elements)} text elements using markdown strategy")
+            return elements
+            
+        except Exception as e:
+            logger.error(f"Error in markdown text extraction: {e}")
+            logger.info("Falling back to regular text extraction")
+            return self._extract_text_elements(pdf_path)
+    
+    def _detect_page_breaks_in_text(self, text: str) -> List[int]:
+        """
+        Detect potential page breaks in text to help estimate page numbers.
+        
+        Args:
+            text: Full text content
+            
+        Returns:
+            List of character positions where page breaks likely occur
+        """
+        import re
+        
+        page_breaks = []
+        
+        # Look for common page break indicators
+        patterns = [
+            r'\n\s*Page\s+\d+\s*\n',  # "Page X" indicators
+            r'\n\s*\d+\s*\n',         # Standalone page numbers
+            r'\f',                     # Form feed characters
+            r'\n\s*[-=]{3,}\s*\n',    # Horizontal lines
+        ]
+        
+        for pattern in patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                page_breaks.append(match.start())
+        
+        # Sort and remove duplicates
+        page_breaks = sorted(list(set(page_breaks)))
+        
+        # If no explicit breaks found, estimate based on text length
+        if not page_breaks:
+            # Estimate page breaks every ~2000-3000 characters (rough page estimate)
+            avg_chars_per_page = 2500
+            for i in range(avg_chars_per_page, len(text), avg_chars_per_page):
+                page_breaks.append(i)
+        
+        return page_breaks
+    
+    def _estimate_page_number(self, chunk_text: str, full_text: str, page_breaks: List[int]) -> int:
+        """
+        Estimate the page number for a text chunk.
+        
+        Args:
+            chunk_text: The text chunk to find page for
+            full_text: Full document text
+            page_breaks: List of character positions where pages likely break
+            
+        Returns:
+            Estimated page number
+        """
+        try:
+            # Find the position of this chunk in the full text
+            chunk_position = full_text.find(chunk_text)
+            
+            if chunk_position == -1:
+                return 1  # Fallback if chunk not found
+            
+            # Count how many page breaks occur before this position
+            page_number = 1
+            for break_pos in page_breaks:
+                if break_pos < chunk_position:  # Breaks that occur before this chunk
+                    page_number += 1
+                else:
+                    break
+            
+            return page_number
+            
+        except Exception as e:
+            logger.warning(f"Error estimating page number: {e}")
+            return 1
+    
+    def _extract_text_elements(self, pdf_path: str) -> List[ExtractedElement]:
+        """
+        Extract text elements from PDF using regular PyMuPDF text extraction.
+        This is the fallback method when pymupdf4llm is not available.
+        Now extracts real page numbers when possible.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            List of text elements
+        """
+        elements = []
+        
+        try:
+            doc = fitz.open(pdf_path)
+            
+            # Process each page individually to preserve page numbers
+            for page_num in range(doc.page_count):
+                page = doc[page_num]
+                page_text = page.get_text()
+                
+                if page_text.strip():
+                    # Use RecursiveCharacterTextSplitter for this page's text
+                    chunks = self.text_splitter.split_text(page_text)
+                    
+                    # Create ExtractedElement for each chunk with real page number
+                    for i, chunk_text in enumerate(chunks):
+                        if chunk_text.strip():
+                            element = ExtractedElement(
+                                element_type="text",
+                                content=chunk_text.strip(),
+                                metadata={
+                                    "source": pdf_path,
+                                    "page": page_num + 1,  # Real page number (1-indexed)
+                                    "chunk_index_in_page": i,
+                                    "total_chunks_in_page": len(chunks),
+                                    "extraction_method": "pymupdf_regular_page_aware",
+                                    "text_splitter": "RecursiveCharacterTextSplitter"
+                                },
+                                page_number=page_num + 1,  # Real page number (1-indexed)
+                                element_id=self._generate_element_id(chunk_text, page_num + 1, f"text_p{page_num + 1}_c{i}")
+                            )
+                            elements.append(element)
+            
+            doc.close()
+            
+            logger.info(f"Extracted {len(elements)} text chunks using page-aware regular strategy")
+            return elements
+            
+        except Exception as e:
+            logger.error(f"Error in regular text extraction: {e}")
+            return elements
     
     def elements_to_documents(self, elements: List[ExtractedElement]) -> List[Document]:
         """
