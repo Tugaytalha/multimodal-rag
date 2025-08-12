@@ -70,7 +70,8 @@ class MultimodalVectorDatabase:
             self.text_collection = Chroma(
                 persist_directory=self.text_collection_path,
                 embedding_function=self.embedding_manager.get_text_embedding_function(),
-                collection_name="multimodal_content"
+                collection_name="multimodal_content",
+                collection_metadata={"hnsw:space": "cosine"}
             )
             
             # Page images collection (with multimodal embeddings)
@@ -81,7 +82,8 @@ class MultimodalVectorDatabase:
             self.page_collection = Chroma(
                 persist_directory=self.page_collection_path,
                 embedding_function=page_embedding_function,
-                collection_name="page_images"
+                collection_name="page_images",
+                collection_metadata={"hnsw:space": "cosine"}
             )
             
             logger.info("Collections initialized successfully")
